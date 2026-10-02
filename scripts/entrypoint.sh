@@ -58,7 +58,7 @@ Xvfb "$DISPLAY" \
 sleep 1
 
 # ---------------------------------------------------------
-# Window manager
+# Lightweight window manager
 # ---------------------------------------------------------
 
 su -s /bin/bash browser -c "
@@ -68,7 +68,7 @@ su -s /bin/bash browser -c "
 " &
 
 # ---------------------------------------------------------
-# Chromium
+# Real graphical Chromium browser
 # ---------------------------------------------------------
 
 start_chromium() {
@@ -116,7 +116,7 @@ x11vnc \
     >/tmp/x11vnc.log 2>&1 &
 
 # ---------------------------------------------------------
-# noVNC / WebSocket bridge
+# WebSocket -> TCP VNC bridge used by noVNC
 # ---------------------------------------------------------
 
 websockify \
@@ -140,12 +140,38 @@ su -s /bin/bash browser -c "
 " >/tmp/gunicorn.log 2>&1 &
 
 # ---------------------------------------------------------
-# Wait for nginx configuration
+# Wait for Gunicorn to start and be healthy
+# ---------------------------------------------------------
+
+GUNICORN_READY=0
+
+for i in {1..30}; do
+    if nc -z 127.0.0.1 "$APP_PORT" 2>/dev/null; then
+        echo "[PyBrowser] Gunicorn is ready on port $APP_PORT"
+        GUNICORN_READY=1
+        break
+    fi
+
+    echo "[PyBrowser] Waiting for gunicorn... ($i/30)"
+    sleep 1
+done
+
+if [ "$GUNICORN_READY" -eq 0 ]; then
+    echo "[PyBrowser] Gunicorn failed to start. Exiting."
+    echo "[PyBrowser] Last Gunicorn logs:"
+    tail -n 50 /tmp/gunicorn.log 2>/dev/null || true
+    exit 1
+fi
+
+# ---------------------------------------------------------
+# Validate nginx configuration
 # ---------------------------------------------------------
 
 until nginx -t >/dev/null 2>&1; do
     sleep 1
 done
+
+echo "[PyBrowser] nginx configuration is valid."
 
 # ---------------------------------------------------------
 # Start nginx
@@ -154,7 +180,7 @@ done
 nginx -g 'daemon off;' &
 
 # ---------------------------------------------------------
-# Keep PID 1 alive
+# Keep PID 1 alive while the graphical/browser stack runs
 # ---------------------------------------------------------
 
 while true; do
