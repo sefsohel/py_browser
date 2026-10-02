@@ -35,12 +35,23 @@ BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome")
 PROXY_SERVER = os.getenv("PROXY_SERVER", "")  # optional, e.g. http://user:pass@host:port
 AUDIO_ENABLED = os.getenv("AUDIO", "1") != "0"
 AUDIO_RATE = int(os.getenv("AUDIO_RATE", "32000"))  # Hz, 16-bit stereo PCM
-STREAM_EVERY_NTH = int(os.getenv("STREAM_EVERY_NTH", "2"))  # 1 = ~60 fps, 2 = ~30 fps (lighter on CPU)
+PRESETS = {  # name: (resolution scale, JPEG quality, every-Nth compositor frame)
+    "potato": (0.45, 35, 3),
+    "smooth": (0.60, 45, 2),
+    "balanced": (0.80, 55, 2),
+    "sharp": (1.00, 70, 1),
+}
+LEVELS = list(PRESETS)
+DEFAULT_QUALITY = os.getenv("QUALITY", "smooth") if os.getenv("QUALITY", "smooth") in PRESETS else "smooth"
+COOKIES_JSON = os.getenv("COOKIES_JSON", "")  # optional: Playwright-format cookies (e.g. a logged-in YouTube session)
 
 CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
-    "--disable-gpu",
+    "--use-gl=angle",
+    "--use-angle=swiftshader",
+    "--enable-unsafe-swiftshader",
+    "--ignore-gpu-blocklist",
     "--disable-extensions",
     "--no-first-run",
     "--disable-background-timer-throttling",
@@ -164,6 +175,9 @@ class Session:
         self._tasks: list = []
         self._pos = (-1.0, -1.0)
         self.last_input = time.monotonic()
+        self.level = DEFAULT_QUALITY
+        self.auto = True
+        self.drops = 0
 
     # -- outgoing ---------------------------------------------------------- #
     async def send_json(self, obj: dict) -> None:
@@ -175,6 +189,8 @@ class Session:
 
     async def _on_frame(self, params: dict) -> None:
         # Keep only the newest frame and ack immediately so Chrome never stalls on the network.
+        if self._latest is not None:
+            self.drops += 1  # a frame was replaced before it could be sent = connection/CPU can't keep up
         self._latest = base64.b64decode(params["data"])
         self._frame_evt.set()
         try:
@@ -202,6 +218,34 @@ class Session:
             await self.ws.close(code=4000)
         except Exception:
             pass
+
+    async def set_quality(self, level: str) -> None:
+        if level not in PRESETS:
+            return
+        self.level = level
+        await self._stop_screencast()
+        await self._start_screencast()
+        await self.send_json({"type": "quality", "level": level, "auto": self.auto})
+
+    async def _adapt(self) -> None:
+        """Step quality down when frames get dropped (slow link / busy CPU); creep back up when calm."""
+        calm = 0
+        while True:
+            await asyncio.sleep(3)
+            dropped, self.drops = self.drops, 0
+            if not self.auto:
+                continue
+            i = LEVELS.index(self.level)
+            if dropped >= 12 and i > 0:
+                calm = 0
+                await self.set_quality(LEVELS[i - 1])
+            elif dropped == 0:
+                calm += 1
+                if calm >= 10 and i < LEVELS.index("balanced"):
+                    calm = 0
+                    await self.set_quality(LEVELS[i + 1])
+            else:
+                calm = 0
 
     def push(self, m: dict) -> None:
         self._inbox.append(m)
@@ -244,6 +288,11 @@ class Session:
             user_agent=f"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36",
             locale="en-US",
         )
+        if COOKIES_JSON:
+            try:
+                await self.ctx.add_cookies(json.loads(COOKIES_JSON))
+            except Exception as exc:
+                log.warning("COOKIES_JSON ignored: %s", exc)
         await self.ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         self.ctx.on("page", lambda p: asyncio.create_task(self._on_new_page(p)))
         self.page = await self.ctx.new_page()
@@ -253,16 +302,18 @@ class Session:
         )
         self.page.on("load", lambda _: asyncio.create_task(self._nav_changed(False)))
         self.page.on("dialog", lambda d: asyncio.create_task(d.dismiss()))
-        self._tasks = [asyncio.create_task(self._send_frames()), asyncio.create_task(self._input_worker())]
+        self._tasks = [asyncio.create_task(self._send_frames()), asyncio.create_task(self._input_worker()), asyncio.create_task(self._adapt())]
         await self._start_screencast()
         await self.goto(HOME_URL)
 
     async def _start_screencast(self) -> None:
+        scale, q, nth = PRESETS[self.level]
         self.cdp = await self.ctx.new_cdp_session(self.page)
         self.cdp.on("Page.screencastFrame", self._on_frame)
         await self.cdp.send(
             "Page.startScreencast",
-            {"format": "jpeg", "quality": JPEG_QUALITY, "maxWidth": self.w, "maxHeight": self.h, "everyNthFrame": STREAM_EVERY_NTH},
+            {"format": "jpeg", "quality": q, "maxWidth": max(160, int(self.w * scale)),
+             "maxHeight": max(120, int(self.h * scale)), "everyNthFrame": nth},
         )
 
     async def _stop_screencast(self) -> None:
@@ -311,6 +362,14 @@ class Session:
         try:
             if t == "goto":
                 await self.goto(str(m.get("url", "")))
+            elif t == "quality":
+                lvl = str(m.get("level", ""))
+                if lvl == "auto":
+                    self.auto = True
+                    await self.send_json({"type": "quality", "level": self.level, "auto": True})
+                elif lvl in PRESETS:
+                    self.auto = False
+                    await self.set_quality(lvl)
             elif t == "home":
                 await self.goto(HOME_URL)
             elif t == "back":
@@ -523,6 +582,7 @@ html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.
 @keyframes in{from{transform:translateX(120%);opacity:0}}@keyframes out{to{transform:translateX(120%);opacity:0}}
 #snd .w{opacity:.55}#snd.live .w{opacity:1;animation:wave .9s ease-in-out infinite}#snd.muted .w{display:none}#snd.off{opacity:.4}
 @keyframes wave{50%{opacity:.3}}
+#qual{width:auto;min-width:46px;padding:0 10px;border-radius:18px;font:600 12px/1 Inter,system-ui,sans-serif;color:var(--acc)}
 @media (max-width:560px){#bar .opt{display:none}}
 @media (prefers-reduced-motion:reduce){*{animation-duration:.01s!important;transition-duration:.01s!important}}
 </style></head>
@@ -538,6 +598,7 @@ html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.
   </div>
   <span id="dot" class="" title="Connection"></span>
   <button class="ib" id="snd" title="Sound (click page or here to enable)"><svg viewBox="0 0 24 24"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path class="w" d="M15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"/></svg></button>
+  <button class="ib" id="qual" title="Quality (click to change)">Auto</button>
   <button class="ib opt" id="theme" title="Toggle theme"><svg viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
   <button class="ib opt" id="full" title="Fullscreen"><svg viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
   <div id="prog"></div>
@@ -551,7 +612,7 @@ html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.
 <script>
 const $=id=>document.getElementById(id);
 const stage=$('stage'),cv=$('cv'),ctx=cv.getContext('2d',{alpha:false,desynchronized:true}),url=$('url'),prog=$('prog'),dot=$('dot'),lock=$('lock'),rel=$('rel'),splash=$('splash'),over=$('over'),root=document.documentElement;
-let hb,tries=0,ws,last=0,lastErr='',q=Promise.resolve(),loadT,opened=false;
+let vw=1280,vh=720,hb,tries=0,ws,last=0,lastErr='',q=Promise.resolve(),loadT,opened=false;
 const size=()=>({w:Math.max(320,Math.min(1920,stage.clientWidth|0)),h:Math.max(240,Math.min(1080,stage.clientHeight|0))});
 const send=o=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify(o))};
 
@@ -579,7 +640,7 @@ function drawLatest(){                      // always draw the newest frame, ski
 function connect(){
   lastErr='';opened=false;dot.className='';over.classList.add('hide');splash.classList.remove('hide');
   $('splashTxt').textContent='Starting your private browser\u2026';
-  const {w,h}=size();
+  const {w,h}=size();vw=w;vh=h;
   ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws?w='+w+'&h='+h);
   ws.onopen=()=>{opened=true;tries=0;dot.className='on';cv.focus();clearInterval(hb);hb=setInterval(()=>send({type:'ping'}),10000)};
   ws.onmessage=e=>{
@@ -590,6 +651,7 @@ function connect(){
         lock.dataset.s=m.url.startsWith('https:')?'1':'0';
         document.title=m.title?m.title+' \u2013 PyBrowser':'PyBrowser';
         setLoading(!!m.loading);
+      }else if(m.type==='quality'){$('qual').textContent=m.auto?'Auto':QN[m.level];$('qual').title='Quality: '+(m.auto?'Auto (now '+QN[m.level]+')':QN[m.level])
       }else if(m.type==='error'){lastErr=m.message;toast(m.message)}
       return;
     }
@@ -620,7 +682,7 @@ url.addEventListener('keydown',e=>{
 });
 url.addEventListener('focus',()=>setTimeout(()=>url.select(),0));
 
-const pt=e=>{const r=cv.getBoundingClientRect();return{x:(e.clientX-r.left)*cv.width/r.width,y:(e.clientY-r.top)*cv.height/r.height}};
+const pt=e=>{const r=cv.getBoundingClientRect();return{x:(e.clientX-r.left)*vw/r.width,y:(e.clientY-r.top)*vh/r.height}};
 cv.addEventListener('mousemove',e=>{const n=performance.now();if(n-last<16)return;last=n;send({type:'mouse',action:'move',...pt(e)})});
 cv.addEventListener('mousedown',e=>{
   cv.focus();send({type:'mouse',action:'down',button:e.button,clicks:e.detail||1,...pt(e)});
@@ -644,7 +706,9 @@ cv.addEventListener('keydown',e=>{
 cv.addEventListener('keyup',e=>{if(mod(e)&&e.key.toLowerCase()==='v')return;e.preventDefault();send({type:'key',action:'up',key:e.key})});
 cv.addEventListener('paste',e=>{e.preventDefault();const t=e.clipboardData.getData('text');if(t)send({type:'text',text:t})});
 
-let rt;addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>{const {w,h}=size();send({type:'resize',w,h})},250)});
+let rt;addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>{const {w,h}=size();vw=w;vh=h;send({type:'resize',w,h})},250)});
+const QL=['auto','potato','smooth','balanced','sharp'],QN={potato:'Low',smooth:'Med',balanced:'High',sharp:'Max'};let qi=0;
+$('qual').onclick=()=>{qi=(qi+1)%QL.length;send({type:'quality',level:QL[qi]});if(QL[qi]!=='auto')$('qual').textContent=QN[QL[qi]]};
 /* ---------- sound ---------- */
 let actx,gain,nextT=0,aws,rem=new Uint8Array(0),arate=32000,muted=false,aT;
 const snd=$('snd');
