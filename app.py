@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections import deque
 from contextlib import asynccontextmanager
 from urllib.parse import quote_plus
@@ -26,7 +27,8 @@ log = logging.getLogger("pybrowser")
 MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "2"))
 HOME_URL = os.getenv("HOME_URL", "https://duckduckgo.com")
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "60"))
-IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "900"))  # seconds
+IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "0"))  # seconds without input before closing; 0 = never
+HEARTBEAT_TIMEOUT = 75  # seconds of total silence (no pings either) = client is gone
 MAX_W, MAX_H = 1920, 1080
 # "chrome" = real Google Chrome (has H.264/AAC codecs for video). Set to "" for bundled Chromium.
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome")
@@ -64,7 +66,7 @@ async def lifespan(app: FastAPI):
     if PROXY_SERVER:
         launch_kw["proxy"] = {"server": PROXY_SERVER}
     app.state.browser = await pw.chromium.launch(**launch_kw)
-    app.state.active = 0
+    app.state.sessions = []
     app.state.audio_clients = set()
     app.state.audio_on = False
     audio_task = asyncio.create_task(audio_broadcaster(app)) if AUDIO_ENABLED else None
@@ -161,6 +163,7 @@ class Session:
         self._inbox_evt = asyncio.Event()
         self._tasks: list = []
         self._pos = (-1.0, -1.0)
+        self.last_input = time.monotonic()
 
     # -- outgoing ---------------------------------------------------------- #
     async def send_json(self, obj: dict) -> None:
@@ -191,6 +194,14 @@ class Session:
                     await self.ws.send_bytes(data)
             except Exception:
                 return
+
+    async def evict(self) -> None:
+        """Called when a newer connection needs this session's slot."""
+        await self.send_json({"type": "error", "message": "Session taken over by a new connection"})
+        try:
+            await self.ws.close(code=4000)
+        except Exception:
+            pass
 
     def push(self, m: dict) -> None:
         self._inbox.append(m)
@@ -346,18 +357,22 @@ class Session:
 # --------------------------------------------------------------------------- #
 @app.middleware("http")
 async def allow_embedding(request, call_next):
-    """Let any site embed this app in an <iframe>."""
+    """Allow embedding in an <iframe> from anywhere (incl. file:// and sandboxed pages).
+
+    `frame-ancestors *` does NOT match file:/data:/blob: pages, so we send no framing
+    header at all and strip any that something upstream added.
+    """
     resp = await call_next(request)
-    resp.headers["Content-Security-Policy"] = "frame-ancestors *"
-    if "x-frame-options" in resp.headers:
-        del resp.headers["x-frame-options"]
+    for h in ("x-frame-options", "content-security-policy"):
+        if h in resp.headers:
+            del resp.headers[h]
     return resp
 
 
 @app.get("/healthz")
 async def healthz():
     browser: Browser = app.state.browser
-    return JSONResponse({"ok": browser.is_connected(), "sessions": app.state.active})
+    return JSONResponse({"ok": browser.is_connected(), "sessions": len(app.state.sessions)})
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -394,29 +409,37 @@ async def audio_ws(ws: WebSocket):
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
-    if app.state.active >= MAX_SESSIONS:
-        await ws.send_text(json.dumps({"type": "error", "message": "Server busy: max sessions reached"}))
-        await ws.close(code=1013)
-        return
+    sessions: list = app.state.sessions
+    # Full? Free the least-recently-used slot instead of turning the user away.
+    while len(sessions) >= MAX_SESSIONS:
+        victim = min(sessions, key=lambda x: x.last_input)
+        sessions.remove(victim)
+        await victim.evict()
 
-    app.state.active += 1
     w = clamp(ws.query_params.get("w"), 320, MAX_W, 1280)
     h = clamp(ws.query_params.get("h"), 240, MAX_H, 720)
     sess = Session(ws, app.state.browser, w, h)
+    sessions.append(sess)
     try:
         await sess.start()
         while True:
             try:
-                raw = await asyncio.wait_for(ws.receive_text(), IDLE_TIMEOUT)
+                raw = await asyncio.wait_for(ws.receive_text(), HEARTBEAT_TIMEOUT)
             except asyncio.TimeoutError:
-                await sess.send_json({"type": "error", "message": "Closed after inactivity"})
-                break
+                break  # nothing (not even a ping) for a while: the client is gone
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            if isinstance(msg, dict):
-                sess.push(msg)
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("type") == "ping":
+                if IDLE_TIMEOUT and time.monotonic() - sess.last_input > IDLE_TIMEOUT:
+                    await sess.send_json({"type": "error", "message": "Closed after inactivity"})
+                    break
+                continue
+            sess.last_input = time.monotonic()
+            sess.push(msg)
     except WebSocketDisconnect:
         pass
     except RuntimeError as exc:
@@ -425,7 +448,8 @@ async def ws_endpoint(ws: WebSocket):
     except Exception:
         log.exception("session crashed")
     finally:
-        app.state.active -= 1
+        if sess in sessions:
+            sessions.remove(sess)
         await sess.close()
         try:
             await ws.close()
@@ -527,7 +551,7 @@ html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.
 <script>
 const $=id=>document.getElementById(id);
 const stage=$('stage'),cv=$('cv'),ctx=cv.getContext('2d',{alpha:false,desynchronized:true}),url=$('url'),prog=$('prog'),dot=$('dot'),lock=$('lock'),rel=$('rel'),splash=$('splash'),over=$('over'),root=document.documentElement;
-let ws,last=0,lastErr='',q=Promise.resolve(),loadT,opened=false;
+let hb,tries=0,ws,last=0,lastErr='',q=Promise.resolve(),loadT,opened=false;
 const size=()=>({w:Math.max(320,Math.min(1920,stage.clientWidth|0)),h:Math.max(240,Math.min(1080,stage.clientHeight|0))});
 const send=o=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify(o))};
 
@@ -557,7 +581,7 @@ function connect(){
   $('splashTxt').textContent='Starting your private browser\u2026';
   const {w,h}=size();
   ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws?w='+w+'&h='+h);
-  ws.onopen=()=>{opened=true;dot.className='on';cv.focus()};
+  ws.onopen=()=>{opened=true;tries=0;dot.className='on';cv.focus();clearInterval(hb);hb=setInterval(()=>send({type:'ping'}),10000)};
   ws.onmessage=e=>{
     if(typeof e.data==='string'){
       const m=JSON.parse(e.data);
@@ -572,10 +596,12 @@ function connect(){
     pend=e.data;drawLatest();
   };
   ws.onclose=()=>{
+    clearInterval(hb);
     dot.className='off';cv.classList.remove('show');setLoading(false);
-    $('overH').textContent=/busy/i.test(lastErr)?'Server is busy':'Disconnected';
+    $('overH').textContent=/taken over/i.test(lastErr)?'Opened in another tab':/busy/i.test(lastErr)?'Server is busy':'Disconnected';
     $('overP').textContent=lastErr||'The session ended.';
     splash.classList.add('hide');over.classList.remove('hide');
+    if(!/taken over/i.test(lastErr)&&tries<4){tries++;setTimeout(()=>{if(ws.readyState>1)connect()},1500*tries)}
   };
 }
 $('reco').onclick=connect;
@@ -660,6 +686,7 @@ snd.onclick=()=>{
 addEventListener('pointerdown',e=>{if(!e.target.closest('#snd'))initAudio()});
 addEventListener('keydown',()=>initAudio());
 
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&ws&&ws.readyState>1&&!/taken over/i.test(lastErr))connect()});
 connect();
 </script></body></html>
 """
