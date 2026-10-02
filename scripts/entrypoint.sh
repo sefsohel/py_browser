@@ -22,20 +22,30 @@ else
 fi
 
 VNC_PASS_FILE=/data/.vnc-password
-x11vnc -storepasswd "$VNC_PASSWORD" "$VNC_PASS_FILE" >/dev/null
+
+x11vnc \
+    -storepasswd "$VNC_PASSWORD" "$VNC_PASS_FILE" >/dev/null
+
 chmod 600 "$VNC_PASS_FILE"
 
 # Create nginx config from the template using Railway's injected PORT.
 export PORT APP_PORT
-envsubst '${PORT} ${APP_PORT}' < /etc/nginx/templates/default.conf.template > /etc/nginx/nginx.conf
+
+envsubst '${PORT} ${APP_PORT}' \
+    < /etc/nginx/templates/default.conf.template \
+    > /etc/nginx/nginx.conf
 
 cleanup() {
     echo "[PyBrowser] Shutting down..."
     jobs -pr | xargs -r kill 2>/dev/null || true
 }
+
 trap cleanup EXIT INT TERM
 
-# Virtual display: real Chromium will render into this X display.
+# ---------------------------------------------------------
+# Virtual display
+# ---------------------------------------------------------
+
 Xvfb "$DISPLAY" \
     -screen 0 1920x1080x24 \
     -ac \
@@ -47,20 +57,29 @@ Xvfb "$DISPLAY" \
 
 sleep 1
 
-# Lightweight window manager so Chromium has a normal desktop window.
+# ---------------------------------------------------------
+# Window manager
+# ---------------------------------------------------------
+
 su -s /bin/bash browser -c "
     export DISPLAY='$DISPLAY'
     export HOME=/home/browser
     openbox-session >/tmp/openbox.log 2>&1
 " &
 
-# Real graphical Chromium browser. This is NOT a page-fetching proxy.
+# ---------------------------------------------------------
+# Chromium
+# ---------------------------------------------------------
+
 start_chromium() {
     echo "[PyBrowser] Starting Chromium..."
+
     su -s /bin/bash browser -c "
         export DISPLAY='$DISPLAY'
         export HOME=/home/browser
+
         mkdir -p '$DATA_DIR' '$DOWNLOAD_DIR'
+
         exec chromium \
           --start-maximized \
           --window-size=1920,1080 \
@@ -76,9 +95,13 @@ start_chromium() {
           >/tmp/chromium.log 2>&1
     " &
 }
+
 start_chromium
 
-# VNC server exposes the actual Chromium/X11 desktop.
+# ---------------------------------------------------------
+# VNC server
+# ---------------------------------------------------------
+
 x11vnc \
     -display "$DISPLAY" \
     -rfbport 5900 \
@@ -92,46 +115,75 @@ x11vnc \
     -defer 5 \
     >/tmp/x11vnc.log 2>&1 &
 
-# WebSocket -> TCP VNC bridge used by noVNC.
+# ---------------------------------------------------------
+# noVNC / WebSocket bridge
+# ---------------------------------------------------------
+
 websockify \
     --web=/usr/share/novnc \
     --heartbeat=30 \
     6080 127.0.0.1:5900 \
     >/tmp/websockify.log 2>&1 &
 
-# Python 3.11 control/health service.
+# ---------------------------------------------------------
+# Python 3.11 control / health service
+# ---------------------------------------------------------
+
 su -s /bin/bash browser -c "
     cd /app
-    gunicorn --workers 1 --threads 2 --bind 127.0.0.1:$APP_PORT app:app
+
+    gunicorn \
+      --workers 1 \
+      --threads 2 \
+      --bind 0.0.0.0:$APP_PORT \
+      app:app
 " >/tmp/gunicorn.log 2>&1 &
 
-# Wait until nginx can validate its config, then put the public service online.
+# ---------------------------------------------------------
+# Wait for nginx configuration
+# ---------------------------------------------------------
+
 until nginx -t >/dev/null 2>&1; do
     sleep 1
 done
+
+# ---------------------------------------------------------
+# Start nginx
+# ---------------------------------------------------------
+
 nginx -g 'daemon off;' &
 
-# Keep PID 1 alive while the graphical/browser stack runs.
+# ---------------------------------------------------------
+# Keep PID 1 alive
+# ---------------------------------------------------------
+
 while true; do
+
     if ! kill -0 "$(pgrep -o Xvfb || echo 0)" 2>/dev/null; then
         echo "[PyBrowser] Xvfb stopped. Exiting for Railway restart."
         exit 1
     fi
+
     if ! pgrep -x x11vnc >/dev/null; then
         echo "[PyBrowser] x11vnc stopped. Exiting for Railway restart."
         exit 1
     fi
+
     if ! pgrep -x websockify >/dev/null; then
         echo "[PyBrowser] websockify stopped. Exiting for Railway restart."
         exit 1
     fi
+
     if ! pgrep -x chromium >/dev/null; then
         echo "[PyBrowser] Chromium stopped; restarting browser..."
         start_chromium
     fi
+
     if ! pgrep -x nginx >/dev/null; then
         echo "[PyBrowser] nginx stopped. Exiting for Railway restart."
         exit 1
     fi
+
     sleep 10
+
 done
