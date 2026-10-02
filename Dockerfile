@@ -1,132 +1,29 @@
 FROM python:3.11-slim-bookworm
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
 
-# ---------------------------------------------------------
-# Install system packages
-# ---------------------------------------------------------
-
+# nginx (reverse proxy + basic auth), envsubst (config templating), openssl (htpasswd hash)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        chromium \
-        chromium-sandbox \
-        xvfb \
-        openbox \
-        x11vnc \
-        nginx \
-        novnc \
-        websockify \
-        tini \
-        gettext-base \
-        ca-certificates \
-        fonts-liberation \
-        fonts-noto-color-emoji \
-        fonts-noto-cjk \
-        fonts-noto-core \
-        fonts-noto-extra \
-        procps \
-        bash \
-        curl \
-    && rm -rf /var/lib/apt/lists/* \
-    # Debian's default nginx site would clash with our generated config
-    && rm -f /etc/nginx/sites-enabled/default
-
-# ---------------------------------------------------------
-# Create browser user
-# ---------------------------------------------------------
-
-RUN useradd \
-    --create-home \
-    --shell /bin/bash \
-    --uid 1000 \
-    browser
-
-# ---------------------------------------------------------
-# Application directories
-# ---------------------------------------------------------
-
-RUN mkdir -p \
-        /app \
-        /data \
-        /data/chromium \
-        /data/downloads \
-        /etc/nginx/templates \
-        /tmp/.X11-unix \
-    && chown -R browser:browser \
-        /app \
-        /data \
-        /home/browser \
-    && chmod 1777 /tmp/.X11-unix
-
-# ---------------------------------------------------------
-# Application working directory
-# ---------------------------------------------------------
+ && apt-get install -y --no-install-recommends \
+      nginx gettext-base openssl ca-certificates fonts-liberation fonts-noto-color-emoji \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# ---------------------------------------------------------
-# Python dependencies
-# ---------------------------------------------------------
+COPY requirements.txt .
+RUN pip install -r requirements.txt \
+ && playwright install --with-deps chromium \
+ && ls /root/.cache/ms-playwright \
+ && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
+COPY app.py .
+COPY nginx/default.conf.template /etc/nginx/templates/default.conf.template
+COPY scripts/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r /app/requirements.txt
-
-# ---------------------------------------------------------
-# Python application
-# ---------------------------------------------------------
-
-COPY app.py /app/app.py
-
-# ---------------------------------------------------------
-# nginx configuration template
-# ---------------------------------------------------------
-
-COPY nginx/default.conf.template \
-    /etc/nginx/templates/default.conf.template
-
-# ---------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------
-
-COPY scripts/entrypoint.sh /app/entrypoint.sh
-
-# sed strips Windows (CRLF) line endings if the script was edited on
-# Windows, which would otherwise break the shebang.
-RUN sed -i 's/\r$//' /app/entrypoint.sh \
-    && chmod +x /app/entrypoint.sh
-
-# ---------------------------------------------------------
-# Environment
-# ---------------------------------------------------------
-
-ENV DISPLAY=:99 \
-    PORT=8080 \
-    APP_PORT=8000 \
-    BROWSER_DATA_DIR=/data/chromium \
-    BROWSER_DOWNLOAD_DIR=/data/downloads
-
-# ---------------------------------------------------------
-# Ports
-# ---------------------------------------------------------
-# Only nginx is public. Gunicorn (8000), noVNC (6080) and VNC (5900)
-# are internal and reached through nginx.
-
+# Railway injects $PORT at runtime; nginx listens on it.
 EXPOSE 8080
 
-# ---------------------------------------------------------
-# Tini (PID 1)
-# ---------------------------------------------------------
-# -g forwards signals to the whole process group so every child
-# shuts down cleanly. Tini also reaps zombie processes.
-
-ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
-
-# ---------------------------------------------------------
-# Start application
-# ---------------------------------------------------------
-
-CMD ["/app/entrypoint.sh"]
+ENTRYPOINT ["/entrypoint.sh"]
