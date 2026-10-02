@@ -303,7 +303,9 @@ async def login(request: Request):
     _fails.pop(ip, None)
     resp = JSONResponse({"ok": True})
     secure = request.headers.get("x-forwarded-proto", "").split(",")[0].strip() == "https"
-    resp.set_cookie(COOKIE, make_token(), max_age=SESSION_TTL, httponly=True, samesite="lax", secure=secure, path="/")
+    # SameSite=None (HTTPS only) lets the login cookie work when the site is embedded in an iframe.
+    resp.set_cookie(COOKIE, make_token(), max_age=SESSION_TTL, httponly=True,
+                    samesite="none" if secure else "lax", secure=secure, path="/")
     return resp
 
 
@@ -379,6 +381,7 @@ INDEX_HTML = r"""<!doctype html>
 <html lang="en" data-theme="dark"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>PyBrowser</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%2096%2096%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cdefs%3E%3ClinearGradient%20id%3D%22lgf%22%20x1%3D%220%22%20y1%3D%220%22%20x2%3D%221%22%20y2%3D%221%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%237c9cff%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%23b57cff%22%2F%3E%3C%2FlinearGradient%3E%3C%2Fdefs%3E%3Crect%20width%3D%2296%22%20height%3D%2296%22%20rx%3D%2226%22%20fill%3D%22url%28%23lgf%29%22%2F%3E%3Ccircle%20cx%3D%2248%22%20cy%3D%2248%22%20r%3D%2226%22%20fill%3D%22none%22%20stroke%3D%22%23fff%22%20stroke-width%3D%224%22%2F%3E%3Cellipse%20cx%3D%2248%22%20cy%3D%2248%22%20rx%3D%2211%22%20ry%3D%2226%22%20fill%3D%22none%22%20stroke%3D%22%23fff%22%20stroke-width%3D%224%22%20opacity%3D%22.9%22%2F%3E%3Cpath%20d%3D%22M22%2048h52M27%2034h42M27%2062h42%22%20stroke%3D%22%23fff%22%20stroke-width%3D%223.5%22%20stroke-linecap%3D%22round%22%20fill%3D%22none%22%20opacity%3D%22.9%22%2F%3E%3Cpath%20d%3D%22M58%2056l22%208-9%203-3%209z%22%20fill%3D%22%23fff%22%20stroke%3D%22%237c9cff%22%20stroke-width%3D%222.5%22%20stroke-linejoin%3D%22round%22%2F%3E%3C%2Fsvg%3E">
 <style>
 :root{--bg:#0e1015;--bar:#161922e6;--chip:#232837;--chip2:#2f3548;--fg:#e9ebf2;--mut:#8a92a8;--acc:#7c9cff;--acc2:#b57cff;--ok:#4ade80;--bad:#f87171;--warn:#fbbf24;--sh:0 10px 34px #0007}
 :root[data-theme=light]{--bg:#eceff5;--bar:#ffffffe6;--chip:#e5e8f0;--chip2:#d6dbe8;--fg:#1a1e2b;--mut:#657090;--sh:0 10px 34px #0002}
@@ -420,8 +423,7 @@ html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.
 @keyframes float{to{transform:translate(60px,-40px) scale(1.2)}}
 .card{position:relative;animation:rise .7s cubic-bezier(.2,.9,.3,1) both}
 @keyframes rise{from{transform:translateY(24px);opacity:0}}
-.logo{width:76px;height:76px;margin:0 auto 18px;border-radius:22px;display:grid;place-items:center;font-weight:800;font-size:28px;
-  color:#fff;background:linear-gradient(135deg,var(--acc),var(--acc2));box-shadow:var(--sh);animation:bob 2.2s ease-in-out infinite}
+.logo{display:block;width:84px;height:84px;margin:0 auto 18px;filter:drop-shadow(0 10px 22px #7c9cff55);animation:bob 2.2s ease-in-out infinite}
 @keyframes bob{50%{transform:translateY(-8px)}}
 .ring{width:26px;height:26px;margin:16px auto 0;border-radius:50%;border:3px solid var(--chip2);border-top-color:var(--acc);animation:rot .8s linear infinite}
 .card h1{margin:0 0 4px;font-size:22px}.card p{margin:0;color:var(--mut)}
@@ -454,9 +456,9 @@ html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.
 </div>
 <div id="stage"><canvas id="cv" tabindex="0"></canvas></div>
 <div id="splash"><div class="blob b1"></div><div class="blob b2"></div>
-  <div class="card"><div class="logo">Py</div><h1>PyBrowser</h1><p id="splashTxt">Starting your private browser&hellip;</p><div class="ring"></div></div></div>
+  <div class="card"><svg class="logo" role="img" aria-label="PyBrowser" viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="lg1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c9cff"/><stop offset="1" stop-color="#b57cff"/></linearGradient></defs><rect width="96" height="96" rx="26" fill="url(#lg1)"/><circle cx="48" cy="48" r="26" fill="none" stroke="#fff" stroke-width="4"/><ellipse cx="48" cy="48" rx="11" ry="26" fill="none" stroke="#fff" stroke-width="4" opacity=".9"/><path d="M22 48h52M27 34h42M27 62h42" stroke="#fff" stroke-width="3.5" stroke-linecap="round" fill="none" opacity=".9"/><path d="M58 56l22 8-9 3-3 9z" fill="#fff" stroke="#7c9cff" stroke-width="2.5" stroke-linejoin="round"/></svg><p id="splashTxt">Starting your private browser&hellip;</p><div class="ring"></div></div></div>
 <div id="over" class="hide"><div class="blob b1"></div><div class="blob b2"></div>
-  <div class="card"><div class="logo">!</div><h1 id="overH">Disconnected</h1><p id="overP">The session ended.</p><button class="btn" id="reco">Reconnect</button></div></div>
+  <div class="card"><svg class="logo" role="img" aria-label="PyBrowser" viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="lg3" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c9cff"/><stop offset="1" stop-color="#b57cff"/></linearGradient></defs><rect width="96" height="96" rx="26" fill="url(#lg3)"/><circle cx="48" cy="48" r="26" fill="none" stroke="#fff" stroke-width="4"/><ellipse cx="48" cy="48" rx="11" ry="26" fill="none" stroke="#fff" stroke-width="4" opacity=".9"/><path d="M22 48h52M27 34h42M27 62h42" stroke="#fff" stroke-width="3.5" stroke-linecap="round" fill="none" opacity=".9"/><path d="M58 56l22 8-9 3-3 9z" fill="#fff" stroke="#7c9cff" stroke-width="2.5" stroke-linejoin="round"/></svg><h1 id="overH">Disconnected</h1><p id="overP">The session ended.</p><button class="btn" id="reco">Reconnect</button></div></div>
 <div id="toasts"></div>
 <script>
 const $=id=>document.getElementById(id);
@@ -559,6 +561,7 @@ LOGIN_HTML = r"""<!doctype html>
 <html lang="en" data-theme="dark"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sign in &ndash; PyBrowser</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%2096%2096%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cdefs%3E%3ClinearGradient%20id%3D%22lgf%22%20x1%3D%220%22%20y1%3D%220%22%20x2%3D%221%22%20y2%3D%221%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%237c9cff%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%23b57cff%22%2F%3E%3C%2FlinearGradient%3E%3C%2Fdefs%3E%3Crect%20width%3D%2296%22%20height%3D%2296%22%20rx%3D%2226%22%20fill%3D%22url%28%23lgf%29%22%2F%3E%3Ccircle%20cx%3D%2248%22%20cy%3D%2248%22%20r%3D%2226%22%20fill%3D%22none%22%20stroke%3D%22%23fff%22%20stroke-width%3D%224%22%2F%3E%3Cellipse%20cx%3D%2248%22%20cy%3D%2248%22%20rx%3D%2211%22%20ry%3D%2226%22%20fill%3D%22none%22%20stroke%3D%22%23fff%22%20stroke-width%3D%224%22%20opacity%3D%22.9%22%2F%3E%3Cpath%20d%3D%22M22%2048h52M27%2034h42M27%2062h42%22%20stroke%3D%22%23fff%22%20stroke-width%3D%223.5%22%20stroke-linecap%3D%22round%22%20fill%3D%22none%22%20opacity%3D%22.9%22%2F%3E%3Cpath%20d%3D%22M58%2056l22%208-9%203-3%209z%22%20fill%3D%22%23fff%22%20stroke%3D%22%237c9cff%22%20stroke-width%3D%222.5%22%20stroke-linejoin%3D%22round%22%2F%3E%3C%2Fsvg%3E">
 <style>
 :root{--bg:#0e1015;--bar:#161922e6;--chip:#232837;--chip2:#2f3548;--fg:#e9ebf2;--mut:#8a92a8;--acc:#7c9cff;--acc2:#b57cff;--ok:#4ade80;--bad:#f87171;--sh:0 10px 34px #0007}
 :root[data-theme=light]{--bg:#eceff5;--bar:#ffffffe6;--chip:#e5e8f0;--chip2:#d6dbe8;--fg:#1a1e2b;--mut:#657090;--sh:0 10px 34px #0002}
@@ -573,8 +576,7 @@ body{display:grid;place-items:center}
 @keyframes rise{from{transform:translateY(26px);opacity:0}}
 #card.shake{animation:shake .45s}
 @keyframes shake{20%,60%{transform:translateX(-9px)}40%,80%{transform:translateX(9px)}}
-.logo{width:68px;height:68px;margin:0 auto 14px;border-radius:20px;display:grid;place-items:center;font-weight:800;font-size:26px;color:#fff;
-  background:linear-gradient(135deg,var(--acc),var(--acc2));box-shadow:var(--sh);animation:bob 2.2s ease-in-out infinite}
+.logo{display:block;width:84px;height:84px;margin:0 auto 18px;filter:drop-shadow(0 10px 22px #7c9cff55);animation:bob 2.2s ease-in-out infinite}
 @keyframes bob{50%{transform:translateY(-6px)}}
 h1{margin:0 0 4px;font-size:22px}p.s{margin:0 0 22px;color:var(--mut)}
 .f{position:relative;margin-bottom:12px;text-align:left}
@@ -599,7 +601,7 @@ h1{margin:0 0 4px;font-size:22px}p.s{margin:0 0 22px;color:var(--mut)}
 <body>
 <div class="blob b1"></div><div class="blob b2"></div>
 <form id="card" autocomplete="on">
-  <div class="logo">Py</div><h1>PyBrowser</h1><p class="s">Sign in to start browsing</p>
+  <svg class="logo" role="img" aria-label="PyBrowser" viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="lg2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7c9cff"/><stop offset="1" stop-color="#b57cff"/></linearGradient></defs><rect width="96" height="96" rx="26" fill="url(#lg2)"/><circle cx="48" cy="48" r="26" fill="none" stroke="#fff" stroke-width="4"/><ellipse cx="48" cy="48" rx="11" ry="26" fill="none" stroke="#fff" stroke-width="4" opacity=".9"/><path d="M22 48h52M27 34h42M27 62h42" stroke="#fff" stroke-width="3.5" stroke-linecap="round" fill="none" opacity=".9"/><path d="M58 56l22 8-9 3-3 9z" fill="#fff" stroke="#7c9cff" stroke-width="2.5" stroke-linejoin="round"/></svg><p class="s">Sign in to start browsing</p>
   <div class="f"><input id="u" name="username" placeholder="Username" autocomplete="username" autofocus required></div>
   <div class="f"><input id="p" name="password" type="password" placeholder="Password" autocomplete="current-password" required>
     <button type="button" id="eye" title="Show password"><svg viewBox="0 0 24 24"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
