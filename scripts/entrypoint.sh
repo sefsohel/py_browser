@@ -4,9 +4,16 @@ set -Eeuo pipefail
 DISPLAY="${DISPLAY:-:99}"
 PORT="${PORT:-8080}"
 APP_PORT="${APP_PORT:-8000}"
+
 DATA_DIR="${BROWSER_DATA_DIR:-/data/chromium}"
 DOWNLOAD_DIR="${BROWSER_DOWNLOAD_DIR:-/data/downloads}"
+
 VNC_PASSWORD="${VNC_PASSWORD:-}"
+
+echo "[PyBrowser] Starting PyBrowser..."
+echo "[PyBrowser] DISPLAY=$DISPLAY"
+echo "[PyBrowser] PORT=$PORT"
+echo "[PyBrowser] APP_PORT=$APP_PORT"
 
 # ---------------------------------------------------------
 # Prepare directories
@@ -19,21 +26,27 @@ mkdir -p \
     /tmp/.X11-unix
 
 chown -R browser:browser /data
+
 chmod 1777 /tmp/.X11-unix
 
 # ---------------------------------------------------------
 # VNC password
-# x11vnc classic authentication supports up to 8 chars.
 # ---------------------------------------------------------
 
 if [[ -z "$VNC_PASSWORD" ]]; then
+
     VNC_PASSWORD="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 8)"
+
     echo "[PyBrowser] VNC_PASSWORD was not supplied."
     echo "[PyBrowser] Generated VNC password: $VNC_PASSWORD"
+
 else
+
     VNC_PASSWORD="${VNC_PASSWORD:0:8}"
+
     echo "[PyBrowser] Using supplied VNC_PASSWORD."
     echo "[PyBrowser] Only the first 8 characters are used."
+
 fi
 
 VNC_PASS_FILE="/data/.vnc-password"
@@ -45,11 +58,13 @@ x11vnc \
 chmod 600 "$VNC_PASS_FILE"
 
 # ---------------------------------------------------------
-# Create nginx configuration
-# Railway provides PORT automatically.
+# Generate nginx configuration
 # ---------------------------------------------------------
 
-export PORT APP_PORT
+echo "[PyBrowser] Generating nginx configuration..."
+
+export PORT
+export APP_PORT
 
 envsubst '${PORT} ${APP_PORT}' \
     < /etc/nginx/templates/default.conf.template \
@@ -60,19 +75,20 @@ envsubst '${PORT} ${APP_PORT}' \
 # ---------------------------------------------------------
 
 cleanup() {
+
     echo "[PyBrowser] Shutting down..."
 
     jobs -pr | xargs -r kill 2>/dev/null || true
+
 }
 
 trap cleanup EXIT INT TERM
 
 # ---------------------------------------------------------
 # Start Xvfb
-# Virtual graphical display for Chromium.
 # ---------------------------------------------------------
 
-echo "[PyBrowser] Starting Xvfb on $DISPLAY..."
+echo "[PyBrowser] Starting Xvfb..."
 
 Xvfb "$DISPLAY" \
     -screen 0 1920x1080x24 \
@@ -83,11 +99,22 @@ Xvfb "$DISPLAY" \
     -noreset \
     >/tmp/xvfb.log 2>&1 &
 
-sleep 1
+sleep 2
+
+if ! pgrep -x Xvfb >/dev/null; then
+
+    echo "[PyBrowser] ERROR: Xvfb failed to start."
+
+    cat /tmp/xvfb.log 2>/dev/null || true
+
+    exit 1
+
+fi
+
+echo "[PyBrowser] Xvfb started."
 
 # ---------------------------------------------------------
 # Start Openbox
-# Lightweight window manager.
 # ---------------------------------------------------------
 
 echo "[PyBrowser] Starting Openbox..."
@@ -96,12 +123,13 @@ su -s /bin/bash browser -c "
     export DISPLAY='$DISPLAY'
     export HOME=/home/browser
 
-    openbox-session \
-        >/tmp/openbox.log 2>&1
-" &
+    openbox-session
+" >/tmp/openbox.log 2>&1 &
+
+sleep 1
 
 # ---------------------------------------------------------
-# Chromium
+# Start Chromium
 # ---------------------------------------------------------
 
 start_chromium() {
@@ -117,27 +145,27 @@ start_chromium() {
         mkdir -p '$DATA_DIR/cache'
 
         exec chromium \
-          --start-maximized \
-          --window-size=1920,1080 \
-          --no-first-run \
-          --no-default-browser-check \
-          --disable-dev-shm-usage \
-          --disable-gpu \
-          --disable-session-crashed-bubble \
-          --password-store=basic \
-          --user-data-dir='$DATA_DIR' \
-          --disk-cache-dir='$DATA_DIR/cache' \
-          --no-sandbox \
-          https://www.google.com \
-          >/tmp/chromium.log 2>&1
-    " &
+            --start-maximized \
+            --window-size=1920,1080 \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-dev-shm-usage \
+            --disable-gpu \
+            --disable-session-crashed-bubble \
+            --password-store=basic \
+            --user-data-dir='$DATA_DIR' \
+            --disk-cache-dir='$DATA_DIR/cache' \
+            https://www.google.com
+    " >/tmp/chromium.log 2>&1 &
+
 }
 
 start_chromium
 
+sleep 3
+
 # ---------------------------------------------------------
 # Start x11vnc
-# Exposes the actual Chromium/X11 desktop.
 # ---------------------------------------------------------
 
 echo "[PyBrowser] Starting x11vnc..."
@@ -155,6 +183,20 @@ x11vnc \
     -defer 5 \
     >/tmp/x11vnc.log 2>&1 &
 
+sleep 2
+
+if ! pgrep -x x11vnc >/dev/null; then
+
+    echo "[PyBrowser] ERROR: x11vnc failed to start."
+
+    cat /tmp/x11vnc.log 2>/dev/null || true
+
+    exit 1
+
+fi
+
+echo "[PyBrowser] x11vnc started."
+
 # ---------------------------------------------------------
 # Start noVNC / WebSocket bridge
 # ---------------------------------------------------------
@@ -167,31 +209,86 @@ websockify \
     6080 127.0.0.1:5900 \
     >/tmp/websockify.log 2>&1 &
 
+sleep 2
+
+if ! pgrep -x websockify >/dev/null; then
+
+    echo "[PyBrowser] ERROR: websockify failed to start."
+
+    cat /tmp/websockify.log 2>/dev/null || true
+
+    exit 1
+
+fi
+
+echo "[PyBrowser] websockify started."
+
 # ---------------------------------------------------------
-# Start Python / Gunicorn
+# Validate nginx configuration
+# ---------------------------------------------------------
+
+echo "[PyBrowser] Testing nginx configuration..."
+
+if ! nginx -t; then
+
+    echo "[PyBrowser] ERROR: nginx configuration is invalid."
+
+    exit 1
+
+fi
+
+echo "[PyBrowser] nginx configuration is valid."
+
+# ---------------------------------------------------------
+# Start nginx
+# ---------------------------------------------------------
+
+echo "[PyBrowser] Starting nginx..."
+
+nginx -g 'daemon off;' >/tmp/nginx.log 2>&1 &
+
+sleep 2
+
+if ! pgrep -x nginx >/dev/null; then
+
+    echo "[PyBrowser] ERROR: nginx failed to start."
+
+    cat /tmp/nginx.log 2>/dev/null || true
+
+    exit 1
+
+fi
+
+echo "[PyBrowser] nginx started."
+
+# ---------------------------------------------------------
+# Wait for Gunicorn
 # ---------------------------------------------------------
 
 echo "[PyBrowser] Starting Gunicorn on 0.0.0.0:$APP_PORT..."
 
+GUNICORN_READY=0
+
+# Start Gunicorn in background temporarily so we can verify it.
 su -s /bin/bash browser -c "
     cd /app
 
     exec gunicorn \
-      --workers 1 \
-      --threads 2 \
-      --bind 0.0.0.0:$APP_PORT \
-      app:app
+        --workers 1 \
+        --threads 2 \
+        --bind 0.0.0.0:$APP_PORT \
+        --access-logfile - \
+        --error-logfile - \
+        app:app
 " >/tmp/gunicorn.log 2>&1 &
 
-# ---------------------------------------------------------
-# Wait for Gunicorn to start and accept connections
-#
-# Uses Bash /dev/tcp, so netcat is NOT required.
-# ---------------------------------------------------------
+GUNICORN_PID=$!
 
-echo "[PyBrowser] Waiting for Gunicorn..."
+echo "[PyBrowser] Gunicorn PID: $GUNICORN_PID"
 
-GUNICORN_READY=0
+# ---------------------------------------------------------
+# Gunicorn readiness check
+# ---------------------------------------------------------
 
 for i in {1..30}; do
 
@@ -201,98 +298,158 @@ for i in {1..30}; do
         echo "[PyBrowser] Gunicorn is ready on port $APP_PORT"
 
         GUNICORN_READY=1
+
         break
+
     fi
 
-    echo "[PyBrowser] Waiting for gunicorn... ($i/30)"
+    if ! kill -0 "$GUNICORN_PID" 2>/dev/null; then
+
+        echo "[PyBrowser] Gunicorn process exited."
+
+        echo "[PyBrowser] Gunicorn logs:"
+
+        cat /tmp/gunicorn.log 2>/dev/null || true
+
+        exit 1
+
+    fi
+
+    echo "[PyBrowser] Waiting for Gunicorn... ($i/30)"
 
     sleep 1
+
 done
 
 if [ "$GUNICORN_READY" -eq 0 ]; then
 
-    echo "[PyBrowser] Gunicorn failed to start."
+    echo "[PyBrowser] Gunicorn failed to become ready."
 
     echo "[PyBrowser] Last Gunicorn logs:"
+
     tail -n 100 /tmp/gunicorn.log 2>/dev/null || true
 
     exit 1
+
 fi
 
 # ---------------------------------------------------------
-# Validate nginx configuration
+# Background monitoring
 # ---------------------------------------------------------
 
-echo "[PyBrowser] Validating nginx configuration..."
+monitor_services() {
 
-until nginx -t >/dev/null 2>&1; do
+    while true; do
 
-    echo "[PyBrowser] Waiting for valid nginx configuration..."
+        # ---------------------------------------------
+        # Xvfb
+        # ---------------------------------------------
 
-    sleep 1
-done
+        if ! pgrep -x Xvfb >/dev/null; then
 
-echo "[PyBrowser] nginx configuration is valid."
+            echo "[PyBrowser] Xvfb stopped."
+
+            exit 1
+
+        fi
+
+        # ---------------------------------------------
+        # x11vnc
+        # ---------------------------------------------
+
+        if ! pgrep -x x11vnc >/dev/null; then
+
+            echo "[PyBrowser] x11vnc stopped."
+
+            exit 1
+
+        fi
+
+        # ---------------------------------------------
+        # websockify
+        # ---------------------------------------------
+
+        if ! pgrep -x websockify >/dev/null; then
+
+            echo "[PyBrowser] websockify stopped."
+
+            exit 1
+
+        fi
+
+        # ---------------------------------------------
+        # nginx
+        # ---------------------------------------------
+
+        if ! pgrep -x nginx >/dev/null; then
+
+            echo "[PyBrowser] nginx stopped."
+
+            exit 1
+
+        fi
+
+        # ---------------------------------------------
+        # Chromium
+        # ---------------------------------------------
+
+        if ! pgrep -x chromium >/dev/null; then
+
+            echo "[PyBrowser] Chromium stopped."
+
+            echo "[PyBrowser] Restarting Chromium..."
+
+            start_chromium
+
+        fi
+
+        # ---------------------------------------------
+        # Gunicorn
+        # ---------------------------------------------
+
+        if ! kill -0 "$GUNICORN_PID" 2>/dev/null; then
+
+            echo "[PyBrowser] Gunicorn stopped."
+
+            echo "[PyBrowser] Gunicorn logs:"
+
+            tail -n 100 /tmp/gunicorn.log 2>/dev/null || true
+
+            exit 1
+
+        fi
+
+        sleep 10
+
+    done
+
+}
+
+monitor_services &
+
+MONITOR_PID=$!
 
 # ---------------------------------------------------------
-# Start nginx
+# Keep entrypoint alive
+#
+# Gunicorn remains the primary application process.
 # ---------------------------------------------------------
 
-echo "[PyBrowser] Starting nginx on Railway PORT=$PORT..."
+echo "[PyBrowser] ========================================"
+echo "[PyBrowser] PyBrowser is READY"
+echo "[PyBrowser] Railway PORT: $PORT"
+echo "[PyBrowser] Gunicorn: 127.0.0.1:$APP_PORT"
+echo "[PyBrowser] noVNC: 127.0.0.1:6080"
+echo "[PyBrowser] VNC: 127.0.0.1:5900"
+echo "[PyBrowser] ========================================"
 
-nginx -g 'daemon off;' &
+# Wait for Gunicorn.
+# If Gunicorn exits, the container exits and Railway can restart it.
 
-# ---------------------------------------------------------
-# Monitor all important processes
-# ---------------------------------------------------------
+wait "$GUNICORN_PID"
 
-echo "[PyBrowser] PyBrowser is running."
+GUNICORN_EXIT_CODE=$?
 
-while true; do
+echo "[PyBrowser] Gunicorn exited with code $GUNICORN_EXIT_CODE"
 
-    # Xvfb
-    if ! pgrep -x Xvfb >/dev/null; then
-        echo "[PyBrowser] Xvfb stopped."
-        echo "[PyBrowser] Exiting for Railway restart."
-        exit 1
-    fi
-
-    # x11vnc
-    if ! pgrep -x x11vnc >/dev/null; then
-        echo "[PyBrowser] x11vnc stopped."
-        echo "[PyBrowser] Exiting for Railway restart."
-        exit 1
-    fi
-
-    # websockify
-    if ! pgrep -x websockify >/dev/null; then
-        echo "[PyBrowser] websockify stopped."
-        echo "[PyBrowser] Exiting for Railway restart."
-        exit 1
-    fi
-
-    # Chromium
-    if ! pgrep -x chromium >/dev/null; then
-        echo "[PyBrowser] Chromium stopped."
-        echo "[PyBrowser] Restarting Chromium..."
-
-        start_chromium
-    fi
-
-    # nginx
-    if ! pgrep -x nginx >/dev/null; then
-        echo "[PyBrowser] nginx stopped."
-        echo "[PyBrowser] Exiting for Railway restart."
-        exit 1
-    fi
-
-    # Gunicorn
-    if ! pgrep -f "gunicorn.*app:app" >/dev/null 2>&1; then
-        echo "[PyBrowser] Gunicorn stopped."
-        echo "[PyBrowser] Exiting for Railway restart."
-        exit 1
-    fi
-
-    sleep 10
-
-done
+exit "$GUNICORN_EXIT_CODE"
