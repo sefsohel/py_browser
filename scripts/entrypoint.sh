@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-set -e
+set -eu
 
 # =========================================================
 # PyBrowser Entrypoint
@@ -13,11 +13,37 @@ export APP_PORT="${APP_PORT:-8000}"
 export BROWSER_DATA_DIR="${BROWSER_DATA_DIR:-/data/chromium}"
 export BROWSER_DOWNLOAD_DIR="${BROWSER_DOWNLOAD_DIR:-/data/downloads}"
 
+# Derive X11 socket/lock paths from $DISPLAY (":99" -> "99")
+DISPLAY_NUM="${DISPLAY#:}"
+DISPLAY_NUM="${DISPLAY_NUM%%.*}"
+X_SOCKET="/tmp/.X11-unix/X${DISPLAY_NUM}"
+X_LOCK="/tmp/.X${DISPLAY_NUM}-lock"
+
+VNC_PASSWORD_FILE="/data/.vnc-password"
+
+log() { echo "[PyBrowser] $*"; }
+
+# =========================================================
+# Shutdown handling
+# =========================================================
+# tini (PID 1) forwards signals to this script. On SIGTERM/SIGINT
+# or any exit, kill every background service we started.
+
+cleanup() {
+    trap - EXIT TERM INT
+    log "Shutting down services..."
+    # shellcheck disable=SC2046
+    kill $(jobs -p) 2>/dev/null || true
+}
+
+trap cleanup EXIT
+trap 'exit 143' TERM INT
+
 echo "========================================================="
-echo "[PyBrowser] Starting PyBrowser..."
-echo "[PyBrowser] DISPLAY=$DISPLAY"
-echo "[PyBrowser] Railway PORT=$PORT"
-echo "[PyBrowser] APP_PORT=$APP_PORT"
+log "Starting PyBrowser..."
+log "DISPLAY=$DISPLAY"
+log "PORT=$PORT"
+log "APP_PORT=$APP_PORT"
 echo "========================================================="
 
 
@@ -40,61 +66,167 @@ chmod 1777 /tmp/.X11-unix
 
 
 # =========================================================
-# Generate VNC password
+# VNC password
 # =========================================================
+# x11vnc's -rfbauth needs an obfuscated file made by
+# `x11vnc -storepasswd`, not plain text. VNC auth only uses the
+# first 8 characters of a password.
+#
+# Priority:
+#   1. VNC_PASSWORD env var (set it in Railway; recreated every boot)
+#   2. Existing password file on the /data volume
+#   3. Newly generated random password (printed once to the logs)
 
-VNC_PASSWORD_FILE="/data/.vnc-password"
+if [ -n "${VNC_PASSWORD:-}" ]; then
 
-if [ ! -f "$VNC_PASSWORD_FILE" ]; then
+    if [ "${#VNC_PASSWORD}" -gt 8 ]; then
+        log "WARNING: VNC_PASSWORD is longer than 8 characters; VNC only uses the first 8."
+        VNC_PASSWORD="${VNC_PASSWORD:0:8}"
+    fi
 
-    echo "[PyBrowser] Creating VNC password..."
-
-    # Generate an 8-character random password
-    VNC_PASSWORD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 8)"
-
-    echo "$VNC_PASSWORD" > "$VNC_PASSWORD_FILE"
-
+    log "Using VNC password from VNC_PASSWORD env var."
+    x11vnc -storepasswd "$VNC_PASSWORD" "$VNC_PASSWORD_FILE" >/dev/null 2>&1
     chmod 600 "$VNC_PASSWORD_FILE"
+
+elif [ ! -f "$VNC_PASSWORD_FILE" ]; then
+
+    VNC_PASSWORD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 8 || true)"
+    x11vnc -storepasswd "$VNC_PASSWORD" "$VNC_PASSWORD_FILE" >/dev/null 2>&1
+    chmod 600 "$VNC_PASSWORD_FILE"
+
+    echo "---------------------------------------------------------"
+    log "Generated VNC password: $VNC_PASSWORD"
+    log "(Shown once. Set VNC_PASSWORD env var to choose your own.)"
+    echo "---------------------------------------------------------"
 
 else
 
-    echo "[PyBrowser] Existing VNC password found."
+    log "Existing VNC password found."
 
 fi
 
-VNC_PASSWORD="$(cat "$VNC_PASSWORD_FILE")"
+unset VNC_PASSWORD
 
 
 # =========================================================
-# Generate nginx configuration
+# nginx configuration
 # =========================================================
 
-echo "[PyBrowser] Generating nginx configuration..."
-
-export PORT
-export APP_PORT
+log "Generating nginx configuration..."
 
 envsubst '${PORT} ${APP_PORT}' \
     < /etc/nginx/templates/default.conf.template \
     > /etc/nginx/conf.d/default.conf
 
+log "Validating nginx configuration..."
+
+if ! nginx -t; then
+    log "ERROR: invalid nginx configuration."
+    exit 1
+fi
+
 
 # =========================================================
-# Clean old processes / display lock
+# Service start functions (reused by the monitor loop)
 # =========================================================
 
-echo "[PyBrowser] Cleaning old X11 locks..."
+start_openbox() {
+    su -s /bin/bash browser -c "
+        export DISPLAY='$DISPLAY'
+        exec openbox-session
+    " >> /tmp/openbox.log 2>&1 &
+    OPENBOX_PID=$!
+    log "Openbox PID=$OPENBOX_PID"
+}
 
-rm -f \
-    /tmp/.X99-lock \
-    /tmp/.X11-unix/X99
+start_chromium() {
+    # A persistent profile keeps lock files after a crash/redeploy,
+    # which makes Chromium refuse to start. Remove them first.
+    rm -f "$BROWSER_DATA_DIR"/Singleton{Lock,Socket,Cookie}
+
+    su -s /bin/bash browser -c "
+        export DISPLAY='$DISPLAY'
+
+        exec chromium \
+            --no-sandbox \
+            --disable-setuid-sandbox \
+            --start-maximized \
+            --window-size=1920,1080 \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-dev-shm-usage \
+            --disable-gpu \
+            --disable-session-crashed-bubble \
+            --password-store=basic \
+            --user-data-dir='$BROWSER_DATA_DIR' \
+            --disk-cache-dir='$BROWSER_DATA_DIR/cache' \
+            --download-default-directory='$BROWSER_DOWNLOAD_DIR' \
+            --disable-features=Translate \
+            https://www.google.com
+    " >> /tmp/chromium.log 2>&1 &
+    CHROMIUM_PID=$!
+    log "Chromium PID=$CHROMIUM_PID"
+}
+
+start_x11vnc() {
+    # -localhost: only websockify (same container) can reach raw VNC
+    x11vnc \
+        -display "$DISPLAY" \
+        -forever \
+        -shared \
+        -localhost \
+        -rfbport 5900 \
+        -rfbauth "$VNC_PASSWORD_FILE" \
+        -noxdamage \
+        -repeat \
+        -xkb \
+        >> /tmp/x11vnc.log 2>&1 &
+    X11VNC_PID=$!
+    log "x11vnc PID=$X11VNC_PID"
+}
+
+start_websockify() {
+    websockify \
+        --web=/usr/share/novnc \
+        127.0.0.1:6080 \
+        127.0.0.1:5900 \
+        >> /tmp/websockify.log 2>&1 &
+    WEBSOCKIFY_PID=$!
+    log "websockify PID=$WEBSOCKIFY_PID"
+}
+
+start_nginx() {
+    nginx -g 'daemon off;' &
+    NGINX_PID=$!
+    log "nginx PID=$NGINX_PID"
+}
+
+start_gunicorn() {
+    # Bound to localhost: only nginx needs to reach it.
+    su -s /bin/bash browser -c "
+        cd /app
+
+        exec gunicorn \
+            --workers 1 \
+            --threads 2 \
+            --bind 127.0.0.1:$APP_PORT \
+            --access-logfile - \
+            --error-logfile - \
+            app:app
+    " &
+    GUNICORN_PID=$!
+    log "Gunicorn PID=$GUNICORN_PID"
+}
 
 
 # =========================================================
 # Start Xvfb
 # =========================================================
 
-echo "[PyBrowser] Starting Xvfb..."
+log "Cleaning old X11 locks..."
+rm -f "$X_LOCK" "$X_SOCKET"
+
+log "Starting Xvfb..."
 
 Xvfb "$DISPLAY" \
     -screen 0 1920x1080x24 \
@@ -105,307 +237,81 @@ Xvfb "$DISPLAY" \
     > /tmp/xvfb.log 2>&1 &
 
 XVFB_PID=$!
+log "Xvfb PID=$XVFB_PID"
 
-echo "[PyBrowser] Xvfb PID=$XVFB_PID"
+log "Waiting for X server..."
 
-
-# =========================================================
-# Wait for X server
-# =========================================================
-
-echo "[PyBrowser] Waiting for X server..."
-
-for i in $(seq 1 30); do
-
-    if [ -S "/tmp/.X11-unix/X99" ]; then
-        echo "[PyBrowser] X server is ready."
-        break
-    fi
-
+for _ in $(seq 1 30); do
+    [ -S "$X_SOCKET" ] && break
     sleep 1
-
 done
 
-
-if [ ! -S "/tmp/.X11-unix/X99" ]; then
-    echo "[PyBrowser] ERROR: X server failed to start."
+if [ ! -S "$X_SOCKET" ]; then
+    log "ERROR: X server failed to start."
     cat /tmp/xvfb.log || true
     exit 1
 fi
 
-
-# =========================================================
-# Start Openbox
-# =========================================================
-
-echo "[PyBrowser] Starting Openbox..."
-
-su -s /bin/bash browser -c "
-    export DISPLAY=$DISPLAY
-    openbox-session
-" > /tmp/openbox.log 2>&1 &
-
-OPENBOX_PID=$!
-
-echo "[PyBrowser] Openbox PID=$OPENBOX_PID"
+log "X server is ready."
 
 
 # =========================================================
-# Start Chromium
+# Start the rest
 # =========================================================
 
-echo "[PyBrowser] Starting Chromium..."
+start_openbox
+start_chromium
+start_x11vnc
+start_websockify
+start_nginx
+start_gunicorn
 
-su -s /bin/bash browser -c "
-    export DISPLAY=$DISPLAY
-
-    chromium \
-        --display=$DISPLAY \
-        --start-maximized \
-        --window-size=1920,1080 \
-        --no-first-run \
-        --no-default-browser-check \
-        --disable-dev-shm-usage \
-        --disable-gpu \
-        --disable-session-crashed-bubble \
-        --password-store=basic \
-        --user-data-dir='$BROWSER_DATA_DIR' \
-        --disk-cache-dir='$BROWSER_DATA_DIR/cache' \
-        --download-default-directory='$BROWSER_DOWNLOAD_DIR' \
-        --disable-features=Translate \
-        https://www.google.com
-" > /tmp/chromium.log 2>&1 &
-
-CHROMIUM_PID=$!
-
-echo "[PyBrowser] Chromium PID=$CHROMIUM_PID"
+echo ""
+echo "========================================================="
+log "All services started."
+log "Public PORT       : $PORT (nginx)"
+log "Internal APP_PORT : $APP_PORT (gunicorn, localhost only)"
+log "noVNC / VNC       : 6080 / 5900 (localhost only)"
+echo "========================================================="
+echo ""
 
 
 # =========================================================
-# Start x11vnc
+# Supervise (foreground)
 # =========================================================
+# Critical services (Xvfb, nginx, gunicorn) exiting ends the script,
+# which stops the container so Railway restarts it.
+# Non-critical services (Openbox, Chromium, x11vnc, websockify)
+# are restarted in place.
 
-echo "[PyBrowser] Starting x11vnc..."
+while true; do
 
-x11vnc \
-    -display "$DISPLAY" \
-    -forever \
-    -shared \
-    -rfbport 5900 \
-    -rfbauth "$VNC_PASSWORD_FILE" \
-    -noxdamage \
-    -repeat \
-    -xkb \
-    > /tmp/x11vnc.log 2>&1 &
+    kill -0 "$XVFB_PID" 2>/dev/null || { log "ERROR: Xvfb stopped."; exit 1; }
+    kill -0 "$NGINX_PID" 2>/dev/null || { log "ERROR: nginx stopped."; exit 1; }
+    kill -0 "$GUNICORN_PID" 2>/dev/null || { log "ERROR: Gunicorn stopped."; exit 1; }
 
-X11VNC_PID=$!
+    if ! kill -0 "$OPENBOX_PID" 2>/dev/null; then
+        log "WARNING: Openbox stopped. Restarting..."
+        start_openbox
+    fi
 
-echo "[PyBrowser] x11vnc PID=$X11VNC_PID"
+    if ! kill -0 "$X11VNC_PID" 2>/dev/null; then
+        log "WARNING: x11vnc stopped. Restarting..."
+        start_x11vnc
+    fi
 
+    if ! kill -0 "$WEBSOCKIFY_PID" 2>/dev/null; then
+        log "WARNING: websockify stopped. Restarting..."
+        start_websockify
+    fi
 
-# =========================================================
-# Start websockify / noVNC backend
-# =========================================================
+    if ! kill -0 "$CHROMIUM_PID" 2>/dev/null; then
+        log "WARNING: Chromium stopped. Restarting..."
+        start_chromium
+    fi
 
-echo "[PyBrowser] Starting websockify..."
+    # sleep in the background + wait so signals are handled immediately
+    sleep 5 &
+    wait $! || true
 
-websockify \
-    --web=/usr/share/novnc \
-    6080 \
-    127.0.0.1:5900 \
-    > /tmp/websockify.log 2>&1 &
-
-WEBSOCKIFY_PID=$!
-
-echo "[PyBrowser] websockify PID=$WEBSOCKIFY_PID"
-
-
-# =========================================================
-# Validate nginx configuration
-# =========================================================
-
-echo "[PyBrowser] Validating nginx configuration..."
-
-until nginx -t >/dev/null 2>&1; do
-    echo "[PyBrowser] Waiting for valid nginx configuration..."
-    sleep 1
 done
-
-echo "[PyBrowser] nginx configuration is valid."
-
-
-# =========================================================
-# Start nginx
-# =========================================================
-
-echo "[PyBrowser] Starting nginx on Railway PORT=$PORT..."
-
-nginx -g 'daemon off;' &
-
-NGINX_PID=$!
-
-echo "[PyBrowser] nginx PID=$NGINX_PID"
-
-
-# =========================================================
-# Background service monitoring
-# =========================================================
-
-(
-    while true; do
-
-        # -------------------------------------------------
-        # Xvfb
-        # -------------------------------------------------
-
-        if ! kill -0 "$XVFB_PID" 2>/dev/null; then
-
-            echo "[PyBrowser] ERROR: Xvfb stopped."
-
-            exit 1
-
-        fi
-
-
-        # -------------------------------------------------
-        # x11vnc
-        # -------------------------------------------------
-
-        if ! kill -0 "$X11VNC_PID" 2>/dev/null; then
-
-            echo "[PyBrowser] WARNING: x11vnc stopped."
-            echo "[PyBrowser] Restarting x11vnc..."
-
-            x11vnc \
-                -display "$DISPLAY" \
-                -forever \
-                -shared \
-                -rfbport 5900 \
-                -rfbauth "$VNC_PASSWORD_FILE" \
-                -noxdamage \
-                -repeat \
-                -xkb \
-                > /tmp/x11vnc.log 2>&1 &
-
-            X11VNC_PID=$!
-
-            echo "[PyBrowser] New x11vnc PID=$X11VNC_PID"
-
-        fi
-
-
-        # -------------------------------------------------
-        # websockify
-        # -------------------------------------------------
-
-        if ! kill -0 "$WEBSOCKIFY_PID" 2>/dev/null; then
-
-            echo "[PyBrowser] WARNING: websockify stopped."
-            echo "[PyBrowser] Restarting websockify..."
-
-            websockify \
-                --web=/usr/share/novnc \
-                6080 \
-                127.0.0.1:5900 \
-                > /tmp/websockify.log 2>&1 &
-
-            WEBSOCKIFY_PID=$!
-
-            echo "[PyBrowser] New websockify PID=$WEBSOCKIFY_PID"
-
-        fi
-
-
-        # -------------------------------------------------
-        # nginx
-        # -------------------------------------------------
-
-        if ! kill -0 "$NGINX_PID" 2>/dev/null; then
-
-            echo "[PyBrowser] ERROR: nginx stopped."
-
-            exit 1
-
-        fi
-
-
-        # -------------------------------------------------
-        # Chromium
-        # -------------------------------------------------
-
-        if ! kill -0 "$CHROMIUM_PID" 2>/dev/null; then
-
-            echo "[PyBrowser] WARNING: Chromium stopped."
-            echo "[PyBrowser] Restarting Chromium..."
-
-            su -s /bin/bash browser -c "
-                export DISPLAY=$DISPLAY
-
-                chromium \
-                    --display=$DISPLAY \
-                    --start-maximized \
-                    --window-size=1920,1080 \
-                    --no-first-run \
-                    --no-default-browser-check \
-                    --disable-dev-shm-usage \
-                    --disable-gpu \
-                    --disable-session-crashed-bubble \
-                    --password-store=basic \
-                    --user-data-dir='$BROWSER_DATA_DIR' \
-                    --disk-cache-dir='$BROWSER_DATA_DIR/cache' \
-                    --download-default-directory='$BROWSER_DOWNLOAD_DIR' \
-                    --disable-features=Translate \
-                    https://www.google.com
-            " > /tmp/chromium.log 2>&1 &
-
-            CHROMIUM_PID=$!
-
-            echo "[PyBrowser] New Chromium PID=$CHROMIUM_PID"
-
-        fi
-
-
-        sleep 5
-
-    done
-
-) &
-
-MONITOR_PID=$!
-
-echo "[PyBrowser] Monitor PID=$MONITOR_PID"
-
-
-# =========================================================
-# Final startup information
-# =========================================================
-
-echo ""
-echo "========================================================="
-echo "[PyBrowser] All background services started."
-echo "[PyBrowser] Railway PORT      : $PORT"
-echo "[PyBrowser] Internal APP_PORT: $APP_PORT"
-echo "[PyBrowser] VNC port         : 5900"
-echo "[PyBrowser] noVNC port       : 6080"
-echo "[PyBrowser] Chromium display : $DISPLAY"
-echo "========================================================="
-echo ""
-
-
-# =========================================================
-# Start Python / Gunicorn
-# =========================================================
-
-echo "[PyBrowser] All services started. Running Gunicorn in foreground..."
-
-exec su -s /bin/bash browser -c "
-    cd /app
-
-    exec gunicorn \
-        --workers 1 \
-        --threads 2 \
-        --bind 0.0.0.0:$APP_PORT \
-        --access-logfile - \
-        --error-logfile - \
-        app:app
-"
