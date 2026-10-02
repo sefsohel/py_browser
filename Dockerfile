@@ -1,16 +1,11 @@
 FROM python:3.11-slim-bookworm
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    DISPLAY=:99 \
-    PORT=8080 \
-    APP_PORT=8000 \
-    BROWSER_DATA_DIR=/data/chromium \
-    BROWSER_DOWNLOAD_DIR=/data/downloads
+ENV DEBIAN_FRONTEND=noninteractive
 
-# The container runs a complete graphical Chromium session behind noVNC.
-# Railway publishes the HTTP port it supplies through $PORT.
+# ---------------------------------------------------------
+# System packages
+# ---------------------------------------------------------
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         chromium \
@@ -30,24 +25,107 @@ RUN apt-get update \
         fonts-noto-core \
         fonts-noto-extra \
         procps \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --shell /bin/bash browser \
-    && mkdir -p /data/chromium /data/downloads /run/nginx \
-    && chown -R browser:browser /data
+        bash \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------
+# Create browser user
+# ---------------------------------------------------------
+
+RUN useradd \
+        --create-home \
+        --shell /bin/bash \
+        --uid 1000 \
+        browser
+
+# ---------------------------------------------------------
+# Application directories
+# ---------------------------------------------------------
+
+RUN mkdir -p \
+        /app \
+        /data \
+        /data/chromium \
+        /data/downloads \
+        /etc/nginx/templates \
+        /tmp/.X11-unix \
+    && chown -R browser:browser \
+        /app \
+        /data \
+        /home/browser \
+    && chmod 1777 /tmp/.X11-unix
+
+# ---------------------------------------------------------
+# Python working directory
+# ---------------------------------------------------------
 
 WORKDIR /app
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py ./
-COPY nginx/default.conf.template /etc/nginx/templates/default.conf.template
-COPY scripts/entrypoint.sh ./entrypoint.sh
+# ---------------------------------------------------------
+# Python dependencies
+# ---------------------------------------------------------
 
-RUN chmod +x ./entrypoint.sh \
-    && rm -f /etc/nginx/sites-enabled/default \
-    && rm -f /etc/nginx/conf.d/default.conf
+COPY requirements.txt /app/requirements.txt
+
+RUN pip install \
+        --no-cache-dir \
+        --upgrade pip \
+    && pip install \
+        --no-cache-dir \
+        -r /app/requirements.txt
+
+# ---------------------------------------------------------
+# Copy Python application
+# ---------------------------------------------------------
+
+COPY app.py /app/app.py
+
+# ---------------------------------------------------------
+# Copy nginx template
+# ---------------------------------------------------------
+
+COPY nginx/default.conf.template \
+    /etc/nginx/templates/default.conf.template
+
+# ---------------------------------------------------------
+# Copy entrypoint
+# ---------------------------------------------------------
+
+COPY scripts/entrypoint.sh \
+    /scripts/entrypoint.sh
+
+RUN chmod +x /scripts/entrypoint.sh
+
+# ---------------------------------------------------------
+# Environment variables
+# ---------------------------------------------------------
+
+ENV DISPLAY=:99
+ENV APP_PORT=8000
+ENV BROWSER_DATA_DIR=/data/chromium
+ENV BROWSER_DOWNLOAD_DIR=/data/downloads
+
+# Railway will provide PORT automatically.
+# Do not hard-code Railway's public port.
+
+# ---------------------------------------------------------
+# Expose internal service ports
+# ---------------------------------------------------------
 
 EXPOSE 8080
+EXPOSE 8000
+EXPOSE 6080
+EXPOSE 5900
+
+# ---------------------------------------------------------
+# Tini as PID 1
+# ---------------------------------------------------------
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/app/entrypoint.sh"]
+
+# ---------------------------------------------------------
+# Start PyBrowser
+# ---------------------------------------------------------
+
+CMD ["/scripts/entrypoint.sh"]
