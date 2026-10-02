@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+from collections import deque
 from contextlib import asynccontextmanager
 from urllib.parse import quote_plus
 
@@ -30,6 +31,9 @@ MAX_W, MAX_H = 1920, 1080
 # "chrome" = real Google Chrome (has H.264/AAC codecs for video). Set to "" for bundled Chromium.
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome")
 PROXY_SERVER = os.getenv("PROXY_SERVER", "")  # optional, e.g. http://user:pass@host:port
+AUDIO_ENABLED = os.getenv("AUDIO", "1") != "0"
+AUDIO_RATE = int(os.getenv("AUDIO_RATE", "32000"))  # Hz, 16-bit stereo PCM
+STREAM_EVERY_NTH = int(os.getenv("STREAM_EVERY_NTH", "2"))  # 1 = ~60 fps, 2 = ~30 fps (lighter on CPU)
 
 CHROMIUM_ARGS = [
     "--no-sandbox",
@@ -37,7 +41,9 @@ CHROMIUM_ARGS = [
     "--disable-gpu",
     "--disable-extensions",
     "--no-first-run",
-    "--mute-audio",
+    "--disable-background-timer-throttling",
+    "--disable-renderer-backgrounding",
+    "--disable-backgrounding-occluded-windows",
     "--autoplay-policy=no-user-gesture-required",
     "--disable-blink-features=AutomationControlled",
 ]
@@ -53,16 +59,21 @@ async def lifespan(app: FastAPI):
         "headless": True,
         "channel": BROWSER_CHANNEL or None,
         "args": CHROMIUM_ARGS,
-        "ignore_default_args": ["--enable-automation"],
+        "ignore_default_args": ["--enable-automation", "--mute-audio"],
     }
     if PROXY_SERVER:
         launch_kw["proxy"] = {"server": PROXY_SERVER}
     app.state.browser = await pw.chromium.launch(**launch_kw)
     app.state.active = 0
+    app.state.audio_clients = set()
+    app.state.audio_on = False
+    audio_task = asyncio.create_task(audio_broadcaster(app)) if AUDIO_ENABLED else None
     log.info("Browser %s ready (channel=%s)", app.state.browser.version, BROWSER_CHANNEL or "chromium")
     try:
         yield
     finally:
+        if audio_task:
+            audio_task.cancel()
         await app.state.browser.close()
         await pw.stop()
 
@@ -73,6 +84,44 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+async def audio_broadcaster(app: FastAPI) -> None:
+    """Capture Chrome's audio from the virtual PulseAudio sink and fan it out to listeners."""
+    quick_fails = 0
+    while quick_fails < 5:
+        started = asyncio.get_event_loop().time()
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "parec", "-d", "pbsink.monitor", "--format=s16le",
+                f"--rate={AUDIO_RATE}", "--channels=2", "--latency-msec=30",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            app.state.audio_on = True
+            while True:
+                chunk = await proc.stdout.read(6400)  # ~50 ms
+                if not chunk:
+                    break
+                if chunk.count(0) == len(chunk):
+                    continue  # pure silence: don't waste bandwidth
+                for q in list(app.state.audio_clients):
+                    if q.full():
+                        q.get_nowait()  # listener too slow: drop oldest to stay live
+                    q.put_nowait(chunk)
+        except FileNotFoundError:
+            log.warning("parec not found: audio disabled")
+            break
+        except asyncio.CancelledError:
+            if proc and proc.returncode is None:
+                proc.kill()
+            raise
+        except Exception:
+            log.exception("audio capture error")
+        app.state.audio_on = False
+        quick_fails = quick_fails + 1 if asyncio.get_event_loop().time() - started < 5 else 0
+        await asyncio.sleep(2)
+    log.warning("Audio capture unavailable (is PulseAudio running?)")
+
+
 def normalize_url(raw: str) -> str | None:
     """Turn address-bar input into a safe URL (http/https only) or a search."""
     raw = raw.strip()
@@ -106,6 +155,12 @@ class Session:
         self.page: Page | None = None
         self.cdp = None
         self._lock = asyncio.Lock()
+        self._latest: bytes | None = None
+        self._frame_evt = asyncio.Event()
+        self._inbox: deque = deque()
+        self._inbox_evt = asyncio.Event()
+        self._tasks: list = []
+        self._pos = (-1.0, -1.0)
 
     # -- outgoing ---------------------------------------------------------- #
     async def send_json(self, obj: dict) -> None:
@@ -116,13 +171,50 @@ class Session:
                 pass
 
     async def _on_frame(self, params: dict) -> None:
+        # Keep only the newest frame and ack immediately so Chrome never stalls on the network.
+        self._latest = base64.b64decode(params["data"])
+        self._frame_evt.set()
         try:
-            async with self._lock:
-                await self.ws.send_bytes(base64.b64decode(params["data"]))
-            # Ack only after sending: natural back-pressure for slow clients.
             await self.cdp.send("Page.screencastFrameAck", {"sessionId": params["sessionId"]})
         except Exception:
             pass
+
+    async def _send_frames(self) -> None:
+        while True:
+            await self._frame_evt.wait()
+            self._frame_evt.clear()
+            data, self._latest = self._latest, None
+            if data is None:
+                continue
+            try:
+                async with self._lock:
+                    await self.ws.send_bytes(data)
+            except Exception:
+                return
+
+    def push(self, m: dict) -> None:
+        self._inbox.append(m)
+        self._inbox_evt.set()
+
+    async def _input_worker(self) -> None:
+        """Process input in order, but merge stale mouse-moves and consecutive wheel events."""
+        def kind(x):
+            return (x.get("type"), x.get("action")) if x.get("type") == "mouse" else (x.get("type"), None)
+        while True:
+            await self._inbox_evt.wait()
+            while self._inbox:
+                m = self._inbox.popleft()
+                k = kind(m)
+                if k == ("mouse", "move") and self._inbox and kind(self._inbox[0]) == k:
+                    continue
+                if k == ("mouse", "wheel"):
+                    while self._inbox and kind(self._inbox[0]) == k:
+                        n = self._inbox.popleft()
+                        m["dx"] = float(m.get("dx", 0)) + float(n.get("dx", 0))
+                        m["dy"] = float(m.get("dy", 0)) + float(n.get("dy", 0))
+                        m["x"], m["y"] = n["x"], n["y"]
+                await self.handle(m)
+            self._inbox_evt.clear()
 
     async def _nav_changed(self, loading: bool = False) -> None:
         try:
@@ -150,6 +242,7 @@ class Session:
         )
         self.page.on("load", lambda _: asyncio.create_task(self._nav_changed(False)))
         self.page.on("dialog", lambda d: asyncio.create_task(d.dismiss()))
+        self._tasks = [asyncio.create_task(self._send_frames()), asyncio.create_task(self._input_worker())]
         await self._start_screencast()
         await self.goto(HOME_URL)
 
@@ -158,7 +251,7 @@ class Session:
         self.cdp.on("Page.screencastFrame", self._on_frame)
         await self.cdp.send(
             "Page.startScreencast",
-            {"format": "jpeg", "quality": JPEG_QUALITY, "maxWidth": self.w, "maxHeight": self.h, "everyNthFrame": 1},
+            {"format": "jpeg", "quality": JPEG_QUALITY, "maxWidth": self.w, "maxHeight": self.h, "everyNthFrame": STREAM_EVERY_NTH},
         )
 
     async def _stop_screencast(self) -> None:
@@ -182,6 +275,8 @@ class Session:
             pass
 
     async def close(self) -> None:
+        for t in self._tasks:
+            t.cancel()
         await self._stop_screencast()
         try:
             await self.ctx.close()
@@ -216,7 +311,9 @@ class Session:
             elif t == "mouse":
                 x, y = float(m["x"]), float(m["y"])
                 action = m.get("action")
-                await p.mouse.move(x, y)
+                if (x, y) != self._pos:
+                    await p.mouse.move(x, y)
+                    self._pos = (x, y)
                 if action == "down":
                     await p.mouse.down(button=BUTTONS.get(m.get("button", 0), "left"),
                                        click_count=int(m.get("clicks", 1)))
@@ -247,6 +344,16 @@ class Session:
 # --------------------------------------------------------------------------- #
 # Routes
 # --------------------------------------------------------------------------- #
+@app.middleware("http")
+async def allow_embedding(request, call_next):
+    """Let any site embed this app in an <iframe>."""
+    resp = await call_next(request)
+    resp.headers["Content-Security-Policy"] = "frame-ancestors *"
+    if "x-frame-options" in resp.headers:
+        del resp.headers["x-frame-options"]
+    return resp
+
+
 @app.get("/healthz")
 async def healthz():
     browser: Browser = app.state.browser
@@ -256,6 +363,32 @@ async def healthz():
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return INDEX_HTML
+
+
+@app.websocket("/ws/audio")
+async def audio_ws(ws: WebSocket):
+    await ws.accept()
+    if not app.state.audio_on:
+        await ws.send_text(json.dumps({"type": "noaudio"}))
+        await ws.close()
+        return
+    q: asyncio.Queue = asyncio.Queue(maxsize=24)
+    app.state.audio_clients.add(q)
+    await ws.send_text(json.dumps({"type": "format", "rate": AUDIO_RATE, "channels": 2}))
+
+    async def pump():
+        while True:
+            await ws.send_bytes(await q.get())
+
+    pump_task = asyncio.create_task(pump())
+    try:
+        while True:
+            await ws.receive_text()  # just waits until the client leaves
+    except Exception:
+        pass
+    finally:
+        pump_task.cancel()
+        app.state.audio_clients.discard(q)
 
 
 @app.websocket("/ws")
@@ -283,7 +416,7 @@ async def ws_endpoint(ws: WebSocket):
             except json.JSONDecodeError:
                 continue
             if isinstance(msg, dict):
-                await sess.handle(msg)
+                sess.push(msg)
     except WebSocketDisconnect:
         pass
     except RuntimeError as exc:
@@ -364,6 +497,8 @@ html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.
   padding:10px 14px;border-radius:10px;box-shadow:var(--sh);max-width:340px;animation:in .35s cubic-bezier(.2,.9,.3,1) both}
 .toast.out{animation:out .3s forwards}
 @keyframes in{from{transform:translateX(120%);opacity:0}}@keyframes out{to{transform:translateX(120%);opacity:0}}
+#snd .w{opacity:.55}#snd.live .w{opacity:1;animation:wave .9s ease-in-out infinite}#snd.muted .w{display:none}#snd.off{opacity:.4}
+@keyframes wave{50%{opacity:.3}}
 @media (max-width:560px){#bar .opt{display:none}}
 @media (prefers-reduced-motion:reduce){*{animation-duration:.01s!important;transition-duration:.01s!important}}
 </style></head>
@@ -378,6 +513,7 @@ html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.
     <input id="url" placeholder="Search or enter address (Ctrl+L)" autocomplete="off" spellcheck="false">
   </div>
   <span id="dot" class="" title="Connection"></span>
+  <button class="ib" id="snd" title="Sound (click page or here to enable)"><svg viewBox="0 0 24 24"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path class="w" d="M15.5 8.5a5 5 0 0 1 0 7M19 5a10 10 0 0 1 0 14"/></svg></button>
   <button class="ib opt" id="theme" title="Toggle theme"><svg viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
   <button class="ib opt" id="full" title="Fullscreen"><svg viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
   <div id="prog"></div>
@@ -390,7 +526,7 @@ html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.
 <div id="toasts"></div>
 <script>
 const $=id=>document.getElementById(id);
-const stage=$('stage'),cv=$('cv'),ctx=cv.getContext('2d'),url=$('url'),prog=$('prog'),dot=$('dot'),lock=$('lock'),rel=$('rel'),splash=$('splash'),over=$('over'),root=document.documentElement;
+const stage=$('stage'),cv=$('cv'),ctx=cv.getContext('2d',{alpha:false,desynchronized:true}),url=$('url'),prog=$('prog'),dot=$('dot'),lock=$('lock'),rel=$('rel'),splash=$('splash'),over=$('over'),root=document.documentElement;
 let ws,last=0,lastErr='',q=Promise.resolve(),loadT,opened=false;
 const size=()=>({w:Math.max(320,Math.min(1920,stage.clientWidth|0)),h:Math.max(240,Math.min(1080,stage.clientHeight|0))});
 const send=o=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify(o))};
@@ -404,6 +540,16 @@ function setLoading(on){
     prog.style.transition='width 8s cubic-bezier(.1,.8,.2,1)';prog.style.width='86%';loadT=setTimeout(()=>setLoading(false),30000)}
   else{prog.style.transition='width .25s';prog.style.width='100%';
     setTimeout(()=>{prog.style.transition='opacity .35s';prog.style.opacity=0},260)}
+}
+
+let pend=null,drawing=false;
+function drawLatest(){                      // always draw the newest frame, skip stale ones
+  if(drawing||!pend)return;drawing=true;const b=pend;pend=null;
+  createImageBitmap(b).then(bmp=>{
+    if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height}
+    ctx.drawImage(bmp,0,0);bmp.close();
+    if(!cv.classList.contains('show')){cv.classList.add('show');splash.classList.add('hide')}
+  }).catch(()=>{}).finally(()=>{drawing=false;if(pend)requestAnimationFrame(drawLatest)});
 }
 
 function connect(){
@@ -423,12 +569,7 @@ function connect(){
       }else if(m.type==='error'){lastErr=m.message;toast(m.message)}
       return;
     }
-    q=q.then(async()=>{
-      const bmp=await createImageBitmap(e.data);
-      if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height}
-      ctx.drawImage(bmp,0,0);bmp.close();
-      if(!cv.classList.contains('show')){cv.classList.add('show');splash.classList.add('hide')}
-    }).catch(()=>{});
+    pend=e.data;drawLatest();
   };
   ws.onclose=()=>{
     dot.className='off';cv.classList.remove('show');setLoading(false);
@@ -454,7 +595,7 @@ url.addEventListener('keydown',e=>{
 url.addEventListener('focus',()=>setTimeout(()=>url.select(),0));
 
 const pt=e=>{const r=cv.getBoundingClientRect();return{x:(e.clientX-r.left)*cv.width/r.width,y:(e.clientY-r.top)*cv.height/r.height}};
-cv.addEventListener('mousemove',e=>{const n=performance.now();if(n-last<30)return;last=n;send({type:'mouse',action:'move',...pt(e)})});
+cv.addEventListener('mousemove',e=>{const n=performance.now();if(n-last<16)return;last=n;send({type:'mouse',action:'move',...pt(e)})});
 cv.addEventListener('mousedown',e=>{
   cv.focus();send({type:'mouse',action:'down',button:e.button,clicks:e.detail||1,...pt(e)});
   const r=stage.getBoundingClientRect(),d=document.createElement('div');d.className='rip';
@@ -478,6 +619,47 @@ cv.addEventListener('keyup',e=>{if(mod(e)&&e.key.toLowerCase()==='v')return;e.pr
 cv.addEventListener('paste',e=>{e.preventDefault();const t=e.clipboardData.getData('text');if(t)send({type:'text',text:t})});
 
 let rt;addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>{const {w,h}=size();send({type:'resize',w,h})},250)});
+/* ---------- sound ---------- */
+let actx,gain,nextT=0,aws,rem=new Uint8Array(0),arate=32000,muted=false,aT;
+const snd=$('snd');
+function initAudio(){
+  if(actx){if(actx.state==='suspended')actx.resume();return}
+  try{actx=new (window.AudioContext||window.webkitAudioContext)({latencyHint:'interactive'})}catch(e){return}
+  gain=actx.createGain();gain.connect(actx.destination);connectAudio();
+}
+function connectAudio(){
+  aws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws/audio');
+  aws.binaryType='arraybuffer';
+  aws.onmessage=e=>{
+    if(typeof e.data==='string'){const m=JSON.parse(e.data);
+      if(m.type==='format')arate=m.rate;
+      if(m.type==='noaudio'){snd.classList.add('off');snd.title='Sound unavailable on this server'}return}
+    playPcm(new Uint8Array(e.data));
+  };
+  aws.onclose=()=>setTimeout(()=>{if(actx)connectAudio()},2000);
+}
+function playPcm(u8){
+  if(muted||!actx)return;
+  if(rem.length){const t=new Uint8Array(rem.length+u8.length);t.set(rem);t.set(u8,rem.length);u8=t}
+  const n=Math.floor(u8.length/4);rem=u8.slice(n*4);if(!n)return;
+  const pcm=new Int16Array(u8.buffer,u8.byteOffset,n*2);
+  const buf=actx.createBuffer(2,n,arate),L=buf.getChannelData(0),R=buf.getChannelData(1);
+  for(let i=0;i<n;i++){L[i]=pcm[2*i]/32768;R[i]=pcm[2*i+1]/32768}
+  const src=actx.createBufferSource();src.buffer=buf;src.connect(gain);
+  const now=actx.currentTime;
+  if(nextT<now+0.02)nextT=now+0.09;          // (re)start with a small jitter buffer
+  else if(nextT-now>0.45)return;             // too far behind: drop this chunk to stay in sync
+  src.start(nextT);nextT+=buf.duration;
+  snd.classList.add('live');clearTimeout(aT);aT=setTimeout(()=>snd.classList.remove('live'),400);
+}
+snd.onclick=()=>{
+  if(!actx){initAudio();return}
+  muted=!muted;gain.gain.value=muted?0:1;snd.classList.toggle('muted',muted);
+  if(!muted&&actx.state==='suspended')actx.resume();
+};
+addEventListener('pointerdown',e=>{if(!e.target.closest('#snd'))initAudio()});
+addEventListener('keydown',()=>initAudio());
+
 connect();
 </script></body></html>
 """
