@@ -29,7 +29,7 @@ HOME_URL = os.getenv("HOME_URL", "https://duckduckgo.com")
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "60"))
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "0"))  # seconds without input before closing; 0 = never
 HEARTBEAT_TIMEOUT = 75  # seconds of total silence (no pings either) = client is gone
-MAX_W, MAX_H = 1920, 1080
+MAX_W, MAX_H = int(os.getenv("MAX_W", "1280")), int(os.getenv("MAX_H", "720"))  # bigger = much more CPU/RAM
 # "chrome" = real Google Chrome (has H.264/AAC codecs for video). Set to "" for bundled Chromium.
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome")
 PROXY_SERVER = os.getenv("PROXY_SERVER", "")  # optional, e.g. http://user:pass@host:port
@@ -42,16 +42,15 @@ PRESETS = {  # name: (resolution scale, JPEG quality, every-Nth compositor frame
     "sharp": (1.00, 70, 1),
 }
 LEVELS = list(PRESETS)
-DEFAULT_QUALITY = os.getenv("QUALITY", "smooth") if os.getenv("QUALITY", "smooth") in PRESETS else "smooth"
+DEFAULT_QUALITY = os.getenv("QUALITY", "balanced") if os.getenv("QUALITY", "balanced") in PRESETS else "balanced"
 COOKIES_JSON = os.getenv("COOKIES_JSON", "")  # optional: Playwright-format cookies (e.g. a logged-in YouTube session)
 
 CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-dev-shm-usage",
-    "--use-gl=angle",
-    "--use-angle=swiftshader",
-    "--enable-unsafe-swiftshader",
-    "--ignore-gpu-blocklist",
+    "--disable-gpu",
+    "--disable-features=IsolateOrigins,site-per-process,Translate",
+    "--renderer-process-limit=3",
     "--disable-extensions",
     "--no-first-run",
     "--disable-background-timer-throttling",
@@ -78,6 +77,8 @@ async def lifespan(app: FastAPI):
         launch_kw["proxy"] = {"server": PROXY_SERVER}
     app.state.browser = await pw.chromium.launch(**launch_kw)
     app.state.sessions = []
+    app.state.pw = pw
+    app.state.launch_kw = launch_kw
     app.state.audio_clients = set()
     app.state.audio_on = False
     audio_task = asyncio.create_task(audio_broadcaster(app)) if AUDIO_ENABLED else None
@@ -135,6 +136,18 @@ async def audio_broadcaster(app: FastAPI) -> None:
     log.warning("Audio capture unavailable (is PulseAudio running?)")
 
 
+_launch_lock = asyncio.Lock()
+
+
+async def ensure_browser() -> Browser:
+    """Return a live browser, relaunching Chrome if it crashed or was killed."""
+    async with _launch_lock:
+        if not app.state.browser.is_connected():
+            log.warning("Browser process died: relaunching")
+            app.state.browser = await app.state.pw.chromium.launch(**app.state.launch_kw)
+        return app.state.browser
+
+
 def normalize_url(raw: str) -> str | None:
     """Turn address-bar input into a safe URL (http/https only) or a search."""
     raw = raw.strip()
@@ -178,6 +191,9 @@ class Session:
         self.level = DEFAULT_QUALITY
         self.auto = True
         self.drops = 0
+        self._last_frame = time.monotonic()
+        self._recovering = False
+        self.last_url = ""
 
     # -- outgoing ---------------------------------------------------------- #
     async def send_json(self, obj: dict) -> None:
@@ -191,6 +207,7 @@ class Session:
         # Keep only the newest frame and ack immediately so Chrome never stalls on the network.
         if self._latest is not None:
             self.drops += 1  # a frame was replaced before it could be sent = connection/CPU can't keep up
+        self._last_frame = time.monotonic()
         self._latest = base64.b64decode(params["data"])
         self._frame_evt.set()
         try:
@@ -207,8 +224,12 @@ class Session:
                 continue
             try:
                 async with self._lock:
-                    await self.ws.send_bytes(data)
+                    await asyncio.wait_for(self.ws.send_bytes(data), 10)
             except Exception:
+                try:  # stuck or dead connection: drop it so the page reconnects cleanly
+                    await self.ws.close(code=1011)
+                except Exception:
+                    pass
                 return
 
     async def evict(self) -> None:
@@ -227,25 +248,69 @@ class Session:
         await self._start_screencast()
         await self.send_json({"type": "quality", "level": level, "auto": self.auto})
 
+    async def _restart_screencast(self) -> None:
+        await self._stop_screencast(detach=True)
+        await self._start_screencast()
+
     async def _adapt(self) -> None:
-        """Step quality down when frames get dropped (slow link / busy CPU); creep back up when calm."""
-        calm = 0
+        """Step quality DOWN when frames are being dropped (slow link / busy CPU). Never loops fast."""
         while True:
-            await asyncio.sleep(3)
+            await asyncio.sleep(4)
             dropped, self.drops = self.drops, 0
-            if not self.auto:
-                continue
             i = LEVELS.index(self.level)
-            if dropped >= 12 and i > 0:
-                calm = 0
-                await self.set_quality(LEVELS[i - 1])
-            elif dropped == 0:
-                calm += 1
-                if calm >= 10 and i < LEVELS.index("balanced"):
-                    calm = 0
-                    await self.set_quality(LEVELS[i + 1])
-            else:
-                calm = 0
+            if self.auto and dropped >= 12 and i > 0 and not self._recovering:
+                try:
+                    await asyncio.wait_for(self.set_quality(LEVELS[i - 1]), 10)
+                except Exception:
+                    await self._restart_screencast()
+                await asyncio.sleep(15)  # cool-down
+
+    async def _watchdog(self) -> None:
+        """Detect a hung page or a stalled stream and repair it instead of freezing forever."""
+        bad = 0
+        while True:
+            await asyncio.sleep(5)
+            if self._recovering:
+                continue
+            try:
+                playing = await asyncio.wait_for(self.page.evaluate(
+                    "[...document.querySelectorAll('video')].some(v=>!v.paused&&!v.ended&&v.readyState>2)"), 6)
+                bad = 0
+            except Exception:
+                bad += 1
+                if bad >= 2:
+                    bad = 0
+                    await self._recover("page unresponsive")
+                continue
+            if playing and time.monotonic() - self._last_frame > 6:
+                log.warning("video playing but no frames for 6s: restarting screencast")
+                try:
+                    await asyncio.wait_for(self._restart_screencast(), 10)
+                except Exception:
+                    await self._recover("stream stalled")
+
+    async def _recover(self, reason: str) -> None:
+        if self._recovering:
+            return
+        self._recovering = True
+        log.warning("recovering session (%s)", reason)
+        url = self.last_url
+        try:
+            await self.send_json({"type": "error", "message": "The page stopped responding. Restarting it\u2026"})
+            self.cdp = None
+            try:
+                await asyncio.wait_for(self.ctx.close(), 8)
+            except Exception:
+                pass
+            self.browser = await ensure_browser()
+            await self._open_context()
+            await self._start_screencast()
+            await self.send_json({"type": "viewport", "w": self.w, "h": self.h})
+            await self.goto(url if url and url != "about:blank" else HOME_URL)
+        except Exception:
+            log.exception("recovery failed")
+        finally:
+            self._recovering = False
 
     def push(self, m: dict) -> None:
         self._inbox.append(m)
@@ -276,10 +341,11 @@ class Session:
             title = await self.page.title()
         except Exception:
             title = ""
+        self.last_url = self.page.url
         await self.send_json({"type": "nav", "url": self.page.url, "title": title, "loading": loading})
 
     # -- lifecycle --------------------------------------------------------- #
-    async def start(self) -> None:
+    async def _open_context(self) -> None:
         major = self.browser.version.split(".")[0]
         self.ctx = await self.browser.new_context(
             viewport={"width": self.w, "height": self.h},
@@ -302,26 +368,39 @@ class Session:
         )
         self.page.on("load", lambda _: asyncio.create_task(self._nav_changed(False)))
         self.page.on("dialog", lambda d: asyncio.create_task(d.dismiss()))
-        self._tasks = [asyncio.create_task(self._send_frames()), asyncio.create_task(self._input_worker()), asyncio.create_task(self._adapt())]
+        self.page.on("crash", lambda _: asyncio.create_task(self._recover("page crashed")))
+
+    async def start(self) -> None:
+        await self._open_context()
+        self._tasks = [asyncio.create_task(self._send_frames()), asyncio.create_task(self._input_worker()),
+                       asyncio.create_task(self._adapt()), asyncio.create_task(self._watchdog())]
         await self._start_screencast()
         await self.goto(HOME_URL)
 
     async def _start_screencast(self) -> None:
         scale, q, nth = PRESETS[self.level]
-        self.cdp = await self.ctx.new_cdp_session(self.page)
-        self.cdp.on("Page.screencastFrame", self._on_frame)
+        if self.cdp is None:
+            self.cdp = await self.ctx.new_cdp_session(self.page)
+            self.cdp.on("Page.screencastFrame", self._on_frame)
         await self.cdp.send(
             "Page.startScreencast",
             {"format": "jpeg", "quality": q, "maxWidth": max(160, int(self.w * scale)),
              "maxHeight": max(120, int(self.h * scale)), "everyNthFrame": nth},
         )
 
-    async def _stop_screencast(self) -> None:
+    async def _stop_screencast(self, detach: bool = False) -> None:
+        if not self.cdp:
+            return
         try:
-            await self.cdp.send("Page.stopScreencast")
-            await self.cdp.detach()
+            await asyncio.wait_for(self.cdp.send("Page.stopScreencast"), 5)
         except Exception:
             pass
+        if detach:
+            try:
+                await asyncio.wait_for(self.cdp.detach(), 3)
+            except Exception:
+                pass
+            self.cdp = None
 
     async def _on_new_page(self, popup: Page) -> None:
         """Popups / target=_blank open in the single visible tab instead."""
@@ -339,7 +418,7 @@ class Session:
     async def close(self) -> None:
         for t in self._tasks:
             t.cancel()
-        await self._stop_screencast()
+        await self._stop_screencast(detach=True)
         try:
             await self.ctx.close()
         except Exception:
@@ -407,6 +486,7 @@ class Session:
                 await self._stop_screencast()
                 await p.set_viewport_size({"width": self.w, "height": self.h})
                 await self._start_screencast()
+                await self.send_json({"type": "viewport", "w": self.w, "h": self.h})
         except Exception as exc:  # never let one bad event kill the session
             log.debug("event %s failed: %s", t, exc)
 
@@ -477,10 +557,11 @@ async def ws_endpoint(ws: WebSocket):
 
     w = clamp(ws.query_params.get("w"), 320, MAX_W, 1280)
     h = clamp(ws.query_params.get("h"), 240, MAX_H, 720)
-    sess = Session(ws, app.state.browser, w, h)
+    sess = Session(ws, await ensure_browser(), w, h)
     sessions.append(sess)
     try:
         await sess.start()
+        await sess.send_json({"type": "viewport", "w": sess.w, "h": sess.h})
         while True:
             try:
                 raw = await asyncio.wait_for(ws.receive_text(), HEARTBEAT_TIMEOUT)
@@ -493,6 +574,7 @@ async def ws_endpoint(ws: WebSocket):
             if not isinstance(msg, dict):
                 continue
             if msg.get("type") == "ping":
+                await sess.send_json({"type": "pong"})
                 if IDLE_TIMEOUT and time.monotonic() - sess.last_input > IDLE_TIMEOUT:
                     await sess.send_json({"type": "error", "message": "Closed after inactivity"})
                     break
@@ -612,7 +694,7 @@ html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.
 <script>
 const $=id=>document.getElementById(id);
 const stage=$('stage'),cv=$('cv'),ctx=cv.getContext('2d',{alpha:false,desynchronized:true}),url=$('url'),prog=$('prog'),dot=$('dot'),lock=$('lock'),rel=$('rel'),splash=$('splash'),over=$('over'),root=document.documentElement;
-let vw=1280,vh=720,hb,tries=0,ws,last=0,lastErr='',q=Promise.resolve(),loadT,opened=false;
+let pingAt=0,vw=1280,vh=720,hb,tries=0,ws,last=0,lastErr='',q=Promise.resolve(),loadT,opened=false;
 const size=()=>({w:Math.max(320,Math.min(1920,stage.clientWidth|0)),h:Math.max(240,Math.min(1080,stage.clientHeight|0))});
 const send=o=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify(o))};
 
@@ -642,7 +724,10 @@ function connect(){
   $('splashTxt').textContent='Starting your private browser\u2026';
   const {w,h}=size();vw=w;vh=h;
   ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws?w='+w+'&h='+h);
-  ws.onopen=()=>{opened=true;tries=0;dot.className='on';cv.focus();clearInterval(hb);hb=setInterval(()=>send({type:'ping'}),10000)};
+  ws.onopen=()=>{opened=true;tries=0;dot.className='on';cv.focus();clearInterval(hb);pingAt=0;hb=setInterval(()=>{
+    if(pingAt&&performance.now()-pingAt>25000){ws.close();return}   // server stopped answering: reconnect
+    if(!pingAt){pingAt=performance.now();send({type:'ping'})}
+  },10000)};
   ws.onmessage=e=>{
     if(typeof e.data==='string'){
       const m=JSON.parse(e.data);
@@ -651,6 +736,8 @@ function connect(){
         lock.dataset.s=m.url.startsWith('https:')?'1':'0';
         document.title=m.title?m.title+' \u2013 PyBrowser':'PyBrowser';
         setLoading(!!m.loading);
+      }else if(m.type==='viewport'){vw=m.w;vh=m.h
+      }else if(m.type==='pong'){pingAt=0
       }else if(m.type==='quality'){$('qual').textContent=m.auto?'Auto':QN[m.level];$('qual').title='Quality: '+(m.auto?'Auto (now '+QN[m.level]+')':QN[m.level])
       }else if(m.type==='error'){lastErr=m.message;toast(m.message)}
       return;
