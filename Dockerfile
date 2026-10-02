@@ -4,11 +4,14 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
-# nginx (reverse proxy), envsubst (config templating)
+# nginx (reverse proxy), envsubst (config templating), PulseAudio (virtual sound card for audio streaming)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      nginx gettext-base ca-certificates fonts-liberation fonts-noto-color-emoji \
+      nginx gettext-base ca-certificates pulseaudio pulseaudio-utils fonts-liberation fonts-noto-color-emoji \
  && rm -rf /var/lib/apt/lists/*
+
+# PulseAudio refuses to run as root, so it gets its own user (see scripts/entrypoint.sh)
+RUN useradd --system --home-dir /tmp/pa --shell /usr/sbin/nologin pulsed
 
 WORKDIR /app
 
