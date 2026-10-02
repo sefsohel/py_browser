@@ -111,12 +111,12 @@ class Session:
         except Exception:
             pass
 
-    async def _nav_changed(self) -> None:
+    async def _nav_changed(self, loading: bool = False) -> None:
         try:
             title = await self.page.title()
         except Exception:
             title = ""
-        await self.send_json({"type": "nav", "url": self.page.url, "title": title})
+        await self.send_json({"type": "nav", "url": self.page.url, "title": title, "loading": loading})
 
     # -- lifecycle --------------------------------------------------------- #
     async def start(self) -> None:
@@ -128,9 +128,9 @@ class Session:
         self.page = await self.ctx.new_page()
         self.page.on(
             "framenavigated",
-            lambda f: asyncio.create_task(self._nav_changed()) if f == self.page.main_frame else None,
+            lambda f: asyncio.create_task(self._nav_changed(True)) if f == self.page.main_frame else None,
         )
-        self.page.on("load", lambda _: asyncio.create_task(self._nav_changed()))
+        self.page.on("load", lambda _: asyncio.create_task(self._nav_changed(False)))
         self.page.on("dialog", lambda d: asyncio.create_task(d.dismiss()))
         await self._start_screencast()
         await self.goto(HOME_URL)
@@ -180,12 +180,15 @@ class Session:
             await self.page.goto(url, wait_until="commit", timeout=30000)
         except Exception as exc:
             await self.send_json({"type": "error", "message": str(exc).splitlines()[0][:200]})
+            await self._nav_changed(False)
 
     async def handle(self, m: dict) -> None:
         t, p = m.get("type"), self.page
         try:
             if t == "goto":
                 await self.goto(str(m.get("url", "")))
+            elif t == "home":
+                await self.goto(HOME_URL)
             elif t == "back":
                 await p.go_back(wait_until="commit")
             elif t == "forward":
@@ -280,72 +283,174 @@ async def ws_endpoint(ws: WebSocket):
 # Front-end (single page, no external assets)
 # --------------------------------------------------------------------------- #
 INDEX_HTML = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+<html lang="en" data-theme="dark"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>PyBrowser</title>
 <style>
+:root{--bg:#0e1015;--bar:#161922e6;--chip:#232837;--chip2:#2f3548;--fg:#e9ebf2;--mut:#8a92a8;--acc:#7c9cff;--acc2:#b57cff;--ok:#4ade80;--bad:#f87171;--warn:#fbbf24;--sh:0 10px 34px #0007}
+:root[data-theme=light]{--bg:#eceff5;--bar:#ffffffe6;--chip:#e5e8f0;--chip2:#d6dbe8;--fg:#1a1e2b;--mut:#657090;--sh:0 10px 34px #0002}
 *{box-sizing:border-box}
-html,body{height:100%;margin:0;background:#1e1e22;font:14px system-ui,sans-serif;color:#eee}
-#bar{display:flex;gap:6px;padding:6px;background:#2b2b31;height:44px}
-#bar button{width:34px;border:0;border-radius:6px;background:#3a3a42;color:#eee;font-size:16px;cursor:pointer}
-#bar button:hover{background:#4a4a54}
-#url{flex:1;min-width:0;border:0;border-radius:6px;padding:0 12px;background:#18181b;color:#eee;font-size:14px}
-#stage{position:absolute;top:44px;left:0;right:0;bottom:0;background:#fff}
-#cv{width:100%;height:100%;display:block;outline:none}
-#msg{position:absolute;left:50%;top:12px;transform:translateX(-50%);background:#000c;color:#fff;
-     padding:8px 14px;border-radius:8px;cursor:pointer}
-#msg[hidden]{display:none}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,-apple-system,Segoe UI,sans-serif;overflow:hidden}
+#bar{position:absolute;top:0;left:0;right:0;height:56px;display:flex;align-items:center;gap:6px;padding:0 10px;
+  background:var(--bar);backdrop-filter:blur(14px);border-bottom:1px solid #ffffff12;z-index:5;animation:down .5s cubic-bezier(.2,.9,.3,1) both}
+@keyframes down{from{transform:translateY(-100%);opacity:0}}
+.ib{width:36px;height:36px;border:0;border-radius:50%;background:transparent;color:var(--fg);display:grid;place-items:center;
+  cursor:pointer;position:relative;overflow:hidden;transition:background .2s,transform .15s}
+.ib:hover{background:var(--chip2)}.ib:active{transform:scale(.88)}
+.ib svg{width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.spin svg{animation:rot .8s linear infinite;color:var(--acc)}
+@keyframes rot{to{transform:rotate(360deg)}}
+#pill{flex:1;min-width:0;height:38px;display:flex;align-items:center;gap:8px;padding:0 6px 0 12px;border-radius:19px;
+  background:var(--chip);border:1.5px solid transparent;transition:border-color .25s,box-shadow .25s,background .25s}
+#pill:focus-within{border-color:var(--acc);box-shadow:0 0 0 4px #7c9cff29;background:var(--bg)}
+#lock{width:16px;height:16px;flex:none;color:var(--ok);transition:color .3s}
+#lock[data-s="0"]{color:var(--warn)}
+#lock svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+#url{flex:1;min-width:0;height:100%;border:0;outline:0;background:transparent;color:var(--fg);font:inherit;font-size:14px}
+#url::placeholder{color:var(--mut)}
+#dot{width:9px;height:9px;border-radius:50%;margin:0 6px;background:var(--warn);flex:none;transition:background .3s}
+#dot.on{background:var(--ok);animation:pulse 2.4s infinite}#dot.off{background:var(--bad)}
+@keyframes pulse{0%{box-shadow:0 0 0 0 #4ade8088}70%,100%{box-shadow:0 0 0 8px #4ade8000}}
+#prog{position:absolute;left:0;bottom:-1px;height:3px;width:0;opacity:0;background:linear-gradient(90deg,var(--acc),var(--acc2));
+  border-radius:0 3px 3px 0;box-shadow:0 0 10px var(--acc)}
+#stage{position:absolute;top:56px;left:0;right:0;bottom:0;background:#fff}
+#cv{width:100%;height:100%;display:block;outline:none;opacity:0;transition:opacity .5s}
+#cv.show{opacity:1}.loading #cv{filter:brightness(.96)}
+.rip{position:absolute;width:16px;height:16px;margin:-8px 0 0 -8px;border-radius:50%;border:2px solid var(--acc);
+  background:#7c9cff33;pointer-events:none;animation:rip .55s ease-out forwards}
+@keyframes rip{to{transform:scale(4);opacity:0}}
+#splash,#over{position:absolute;inset:56px 0 0 0;display:grid;place-items:center;text-align:center;z-index:4;
+  background:var(--bg);transition:opacity .5s,visibility .5s;overflow:hidden}
+#splash.hide,#over.hide{opacity:0;visibility:hidden}
+.blob{position:absolute;width:380px;height:380px;border-radius:50%;filter:blur(70px);opacity:.35;animation:float 9s ease-in-out infinite alternate}
+.b1{background:var(--acc);left:12%;top:8%}.b2{background:var(--acc2);right:10%;bottom:6%;animation-delay:-4s}
+@keyframes float{to{transform:translate(60px,-40px) scale(1.2)}}
+.card{position:relative;animation:rise .7s cubic-bezier(.2,.9,.3,1) both}
+@keyframes rise{from{transform:translateY(24px);opacity:0}}
+.logo{width:76px;height:76px;margin:0 auto 18px;border-radius:22px;display:grid;place-items:center;font-weight:800;font-size:28px;
+  color:#fff;background:linear-gradient(135deg,var(--acc),var(--acc2));box-shadow:var(--sh);animation:bob 2.2s ease-in-out infinite}
+@keyframes bob{50%{transform:translateY(-8px)}}
+.ring{width:26px;height:26px;margin:16px auto 0;border-radius:50%;border:3px solid var(--chip2);border-top-color:var(--acc);animation:rot .8s linear infinite}
+.card h1{margin:0 0 4px;font-size:22px}.card p{margin:0;color:var(--mut)}
+.btn{margin-top:18px;border:0;border-radius:22px;padding:10px 22px;font:inherit;font-weight:600;color:#fff;cursor:pointer;
+  background:linear-gradient(135deg,var(--acc),var(--acc2));transition:transform .15s,box-shadow .2s}
+.btn:hover{transform:translateY(-2px);box-shadow:0 8px 20px #7c9cff55}.btn:active{transform:scale(.95)}
+#toasts{position:absolute;right:14px;bottom:14px;display:flex;flex-direction:column;gap:8px;z-index:9;pointer-events:none}
+.toast{background:var(--bar);backdrop-filter:blur(12px);border:1px solid #ffffff1a;border-left:4px solid var(--bad);color:var(--fg);
+  padding:10px 14px;border-radius:10px;box-shadow:var(--sh);max-width:340px;animation:in .35s cubic-bezier(.2,.9,.3,1) both}
+.toast.out{animation:out .3s forwards}
+@keyframes in{from{transform:translateX(120%);opacity:0}}@keyframes out{to{transform:translateX(120%);opacity:0}}
+@media (max-width:560px){#bar .opt{display:none}}
+@media (prefers-reduced-motion:reduce){*{animation-duration:.01s!important;transition-duration:.01s!important}}
 </style></head>
 <body>
 <div id="bar">
-  <button id="back" title="Back">&#8592;</button>
-  <button id="fwd" title="Forward">&#8594;</button>
-  <button id="rel" title="Reload">&#8635;</button>
-  <input id="url" placeholder="Search or enter address" autocomplete="off" spellcheck="false">
+  <button class="ib" id="back" title="Back (Alt+&larr;)"><svg viewBox="0 0 24 24"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button>
+  <button class="ib opt" id="fwd" title="Forward (Alt+&rarr;)"><svg viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7"/></svg></button>
+  <button class="ib" id="rel" title="Reload (Ctrl+R)"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5"/></svg></button>
+  <button class="ib opt" id="home" title="Home"><svg viewBox="0 0 24 24"><path d="M3 11l9-8 9 8M5 10v10h5v-6h4v6h5V10"/></svg></button>
+  <div id="pill">
+    <span id="lock" data-s="1"><svg viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span>
+    <input id="url" placeholder="Search or enter address (Ctrl+L)" autocomplete="off" spellcheck="false">
+  </div>
+  <span id="dot" class="" title="Connection"></span>
+  <button class="ib opt" id="theme" title="Toggle theme"><svg viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+  <button class="ib opt" id="full" title="Fullscreen"><svg viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/></svg></button>
+  <div id="prog"></div>
 </div>
-<div id="stage"><canvas id="cv" tabindex="0"></canvas><div id="msg" hidden></div></div>
+<div id="stage"><canvas id="cv" tabindex="0"></canvas></div>
+<div id="splash"><div class="blob b1"></div><div class="blob b2"></div>
+  <div class="card"><div class="logo">Py</div><h1>PyBrowser</h1><p id="splashTxt">Starting your private browser&hellip;</p><div class="ring"></div></div></div>
+<div id="over" class="hide"><div class="blob b1"></div><div class="blob b2"></div>
+  <div class="card"><div class="logo">!</div><h1 id="overH">Disconnected</h1><p id="overP">The session ended.</p><button class="btn" id="reco">Reconnect</button></div></div>
+<div id="toasts"></div>
 <script>
 const $=id=>document.getElementById(id);
-const stage=$('stage'),cv=$('cv'),ctx=cv.getContext('2d'),url=$('url'),msg=$('msg');
-let ws,last=0,canReconnect=false;
+const stage=$('stage'),cv=$('cv'),ctx=cv.getContext('2d'),url=$('url'),prog=$('prog'),dot=$('dot'),lock=$('lock'),rel=$('rel'),splash=$('splash'),over=$('over'),root=document.documentElement;
+let ws,last=0,lastErr='',q=Promise.resolve(),loadT;
 const size=()=>({w:Math.max(320,Math.min(1920,stage.clientWidth|0)),h:Math.max(240,Math.min(1080,stage.clientHeight|0))});
 const send=o=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify(o))};
-const note=(t,reconnect=false)=>{msg.textContent=t;msg.hidden=false;canReconnect=reconnect};
+
+function toast(t){const d=document.createElement('div');d.className='toast';d.textContent=t;$('toasts').append(d);
+  setTimeout(()=>{d.classList.add('out');setTimeout(()=>d.remove(),300)},4200)}
+
+function setLoading(on){
+  clearTimeout(loadT);root.classList.toggle('loading',on);rel.classList.toggle('spin',on);
+  if(on){prog.style.transition='none';prog.style.opacity=1;prog.style.width='0%';void prog.offsetWidth;
+    prog.style.transition='width 8s cubic-bezier(.1,.8,.2,1)';prog.style.width='86%';loadT=setTimeout(()=>setLoading(false),30000)}
+  else{prog.style.transition='width .25s';prog.style.width='100%';
+    setTimeout(()=>{prog.style.transition='opacity .35s';prog.style.opacity=0},260)}
+}
 
 function connect(){
+  lastErr='';dot.className='';over.classList.add('hide');splash.classList.remove('hide');
+  $('splashTxt').textContent='Starting your private browser\u2026';
   const {w,h}=size();
   ws=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws?w='+w+'&h='+h);
-  ws.onopen=()=>{msg.hidden=true;cv.focus()};
-  ws.onmessage=async e=>{
+  ws.onopen=()=>{dot.className='on';cv.focus()};
+  ws.onmessage=e=>{
     if(typeof e.data==='string'){
       const m=JSON.parse(e.data);
-      if(m.type==='nav'){if(document.activeElement!==url)url.value=m.url;document.title=m.title||'PyBrowser'}
-      else if(m.type==='error'){note(m.message)}
+      if(m.type==='nav'){
+        if(document.activeElement!==url)url.value=m.url==='about:blank'?'':m.url;
+        lock.dataset.s=m.url.startsWith('https:')?'1':'0';
+        document.title=m.title?m.title+' \u2013 PyBrowser':'PyBrowser';
+        setLoading(!!m.loading);
+      }else if(m.type==='error'){lastErr=m.message;toast(m.message)}
       return;
     }
-    const bmp=await createImageBitmap(e.data);
-    if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height}
-    ctx.drawImage(bmp,0,0);bmp.close();
+    q=q.then(async()=>{
+      const bmp=await createImageBitmap(e.data);
+      if(cv.width!==bmp.width||cv.height!==bmp.height){cv.width=bmp.width;cv.height=bmp.height}
+      ctx.drawImage(bmp,0,0);bmp.close();
+      if(!cv.classList.contains('show')){cv.classList.add('show');splash.classList.add('hide')}
+    }).catch(()=>{});
   };
-  ws.onclose=()=>note('Disconnected \u2014 click to reconnect',true);
+  ws.onclose=()=>{
+    dot.className='off';cv.classList.remove('show');setLoading(false);
+    $('overH').textContent=/busy/i.test(lastErr)?'Server is busy':'Disconnected';
+    $('overP').textContent=lastErr||'The session ended.';
+    splash.classList.add('hide');over.classList.remove('hide');
+  };
 }
-msg.onclick=()=>{if(canReconnect){msg.hidden=true;connect()}else msg.hidden=true};
+$('reco').onclick=connect;
 
 $('back').onclick=()=>send({type:'back'});
 $('fwd').onclick=()=>send({type:'forward'});
-$('rel').onclick=()=>send({type:'reload'});
-url.addEventListener('keydown',e=>{if(e.key==='Enter'){send({type:'goto',url:url.value});cv.focus()}});
-url.addEventListener('focus',()=>url.select());
+rel.onclick=()=>send({type:'reload'});
+$('home').onclick=()=>send({type:'home'});
+$('full').onclick=()=>document.fullscreenElement?document.exitFullscreen():root.requestFullscreen().catch(()=>{});
+$('theme').onclick=()=>{const t=root.dataset.theme==='dark'?'light':'dark';root.dataset.theme=t;try{localStorage.setItem('pb-theme',t)}catch(e){}};
+try{const t=localStorage.getItem('pb-theme');if(t)root.dataset.theme=t}catch(e){}
+
+url.addEventListener('keydown',e=>{
+  if(e.key==='Enter'){send({type:'goto',url:url.value});url.blur();cv.focus()}
+  else if(e.key==='Escape'){url.blur();cv.focus()}
+});
+url.addEventListener('focus',()=>setTimeout(()=>url.select(),0));
 
 const pt=e=>{const r=cv.getBoundingClientRect();return{x:(e.clientX-r.left)*cv.width/r.width,y:(e.clientY-r.top)*cv.height/r.height}};
 cv.addEventListener('mousemove',e=>{const n=performance.now();if(n-last<30)return;last=n;send({type:'mouse',action:'move',...pt(e)})});
-cv.addEventListener('mousedown',e=>{cv.focus();send({type:'mouse',action:'down',button:e.button,clicks:e.detail||1,...pt(e)})});
+cv.addEventListener('mousedown',e=>{
+  cv.focus();send({type:'mouse',action:'down',button:e.button,clicks:e.detail||1,...pt(e)});
+  const r=stage.getBoundingClientRect(),d=document.createElement('div');d.className='rip';
+  d.style.left=(e.clientX-r.left)+'px';d.style.top=(e.clientY-r.top)+'px';stage.append(d);d.onanimationend=()=>d.remove();
+});
 cv.addEventListener('mouseup',e=>send({type:'mouse',action:'up',button:e.button,clicks:e.detail||1,...pt(e)}));
 cv.addEventListener('wheel',e=>{e.preventDefault();send({type:'mouse',action:'wheel',dx:e.deltaX,dy:e.deltaY,...pt(e)})},{passive:false});
 cv.addEventListener('contextmenu',e=>e.preventDefault());
-const isPaste=e=>(e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='v';
-cv.addEventListener('keydown',e=>{if(isPaste(e))return;e.preventDefault();send({type:'key',action:'down',key:e.key})});
-cv.addEventListener('keyup',e=>{if(isPaste(e))return;e.preventDefault();send({type:'key',action:'up',key:e.key})});
+
+const mod=e=>e.ctrlKey||e.metaKey;
+cv.addEventListener('keydown',e=>{
+  const k=e.key.toLowerCase();
+  if(mod(e)&&k==='v')return;                                   // let the paste event fire
+  if((mod(e)&&k==='l')||e.key==='F6'){e.preventDefault();url.focus();return}
+  if((mod(e)&&k==='r')||e.key==='F5'){e.preventDefault();send({type:'reload'});return}
+  if(e.altKey&&e.key==='ArrowLeft'){e.preventDefault();send({type:'back'});return}
+  if(e.altKey&&e.key==='ArrowRight'){e.preventDefault();send({type:'forward'});return}
+  e.preventDefault();send({type:'key',action:'down',key:e.key});
+});
+cv.addEventListener('keyup',e=>{if(mod(e)&&e.key.toLowerCase()==='v')return;e.preventDefault();send({type:'key',action:'up',key:e.key})});
 cv.addEventListener('paste',e=>{e.preventDefault();const t=e.clipboardData.getData('text');if(t)send({type:'text',text:t})});
 
 let rt;addEventListener('resize',()=>{clearTimeout(rt);rt=setTimeout(()=>{const {w,h}=size();send({type:'resize',w,h})},250)});
