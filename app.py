@@ -31,6 +31,8 @@ HOME_URL = os.getenv("HOME_URL", "https://duckduckgo.com")
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "60"))
 IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "900"))  # seconds
 MAX_W, MAX_H = 1920, 1080
+# "chrome" = real Google Chrome (has H.264/AAC codecs for video). Set to "" for bundled Chromium.
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome")
 
 # --- Login (all values have defaults; override with Railway variables) ---
 AUTH_USER = os.getenv("BROWSER_USER", "admin")
@@ -46,6 +48,7 @@ CHROMIUM_ARGS = [
     "--disable-extensions",
     "--no-first-run",
     "--mute-audio",
+    "--autoplay-policy=no-user-gesture-required",
 ]
 
 
@@ -55,9 +58,11 @@ CHROMIUM_ARGS = [
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     pw = await async_playwright().start()
-    app.state.browser = await pw.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+    app.state.browser = await pw.chromium.launch(
+        headless=True, channel=BROWSER_CHANNEL or None, args=CHROMIUM_ARGS
+    )
     app.state.active = 0
-    log.info("Chromium %s ready", app.state.browser.version)
+    log.info("Browser %s ready (channel=%s)", app.state.browser.version, BROWSER_CHANNEL or "chromium")
     if AUTH_PASSWORD == "pybrowser":
         log.warning("Using the DEFAULT password. Set BROWSER_PASSWORD in Railway variables!")
     try:
