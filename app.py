@@ -31,7 +31,8 @@ from playwright.async_api import Browser, Page, async_playwright
 # =============================================================================
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO")
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 
 log = logging.getLogger("pybrowser")
@@ -41,13 +42,11 @@ log = logging.getLogger("pybrowser")
 # Configuration
 # =============================================================================
 
-MAX_SESSIONS = int(
-    os.getenv("MAX_SESSIONS", "2")
-)
+MAX_SESSIONS = int(os.getenv("MAX_SESSIONS", "2"))
 
 HOME_URL = os.getenv(
     "HOME_URL",
-    "https://duckduckgo.com"
+    "https://duckduckgo.com",
 )
 
 JPEG_QUALITY = int(
@@ -63,17 +62,34 @@ MAX_H = 1080
 
 
 # =============================================================================
+# Render / server configuration
+# =============================================================================
+
+HOST = os.getenv(
+    "HOST",
+    "0.0.0.0",
+)
+
+PORT = int(
+    os.getenv(
+        "PORT",
+        "10000",
+    )
+)
+
+
+# =============================================================================
 # Authentication
 # =============================================================================
 
 AUTH_USER = os.getenv(
     "BROWSER_USER",
-    "admin"
+    "admin",
 )
 
 AUTH_PASSWORD = os.getenv(
     "BROWSER_PASSWORD",
-    "pybrowser"
+    "pybrowser",
 )
 
 SECRET_KEY = (
@@ -82,7 +98,10 @@ SECRET_KEY = (
 )
 
 SESSION_TTL = int(
-    os.getenv("SESSION_TTL", "86400")
+    os.getenv(
+        "SESSION_TTL",
+        "86400",
+    )
 )
 
 COOKIE = "pb_session"
@@ -103,53 +122,100 @@ CHROMIUM_ARGS = [
 
 
 # =============================================================================
-# App lifecycle
+# App state
 # =============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    Start Playwright + Chromium.
 
-    pw = await async_playwright().start()
+    Startup failures are logged clearly so that Render logs show the actual
+    reason if Chromium cannot start.
+    """
 
-    browser = await pw.chromium.launch(
-        headless=True,
-        args=CHROMIUM_ARGS,
-    )
+    pw = None
+    browser = None
 
-    app.state.browser = browser
+    app.state.browser = None
     app.state.active = 0
+    app.state.browser_error = None
 
-    log.info(
-        "Chromium %s ready",
-        browser.version,
-    )
-
-    if AUTH_PASSWORD == "pybrowser":
-        log.warning(
-            "Using the DEFAULT password. "
-            "Set BROWSER_PASSWORD in Railway variables!"
-        )
+    log.info("Starting PyBrowser...")
+    log.info("Host: %s", HOST)
+    log.info("Port: %s", PORT)
+    log.info("HOME_URL: %s", HOME_URL)
 
     try:
+
+        log.info("Starting Playwright...")
+
+        pw = await async_playwright().start()
+
+        log.info("Launching Chromium...")
+
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=CHROMIUM_ARGS,
+        )
+
+        app.state.browser = browser
+
+        log.info(
+            "Chromium %s ready",
+            browser.version,
+        )
+
+        if AUTH_PASSWORD == "pybrowser":
+            log.warning(
+                "Using the DEFAULT password. "
+                "Set BROWSER_PASSWORD in Render Environment Variables!"
+            )
+
+        yield
+
+    except Exception as exc:
+
+        app.state.browser_error = str(exc)
+
+        log.exception(
+            "FATAL: Chromium / Playwright startup failed"
+        )
+
+        # We do NOT immediately re-raise here.
+        #
+        # This keeps the HTTP server alive so Render can still reach
+        # /healthz and the login page, while the actual error remains visible
+        # in the logs.
+        #
+        # WebSocket connections will be rejected if browser is unavailable.
         yield
 
     finally:
 
-        try:
-            await browser.close()
-        except Exception:
-            log.debug(
-                "Browser close failed",
-                exc_info=True,
-            )
+        log.info(
+            "Shutting down PyBrowser..."
+        )
 
-        try:
-            await pw.stop()
-        except Exception:
-            log.debug(
-                "Playwright stop failed",
-                exc_info=True,
-            )
+        if browser is not None:
+
+            try:
+                await browser.close()
+            except Exception:
+                log.exception(
+                    "Browser close failed"
+                )
+
+        if pw is not None:
+
+            try:
+                await pw.stop()
+            except Exception:
+                log.exception(
+                    "Playwright stop failed"
+                )
+
+        app.state.browser = None
 
 
 app = FastAPI(
@@ -163,12 +229,14 @@ app = FastAPI(
 # Helpers
 # =============================================================================
 
-def normalize_url(raw: str) -> str | None:
+def normalize_url(
+    raw: str,
+) -> str | None:
     """
     Turn address-bar input into a safe URL.
 
-    Only http / https URLs are allowed.
-    Non-URL input is sent to DuckDuckGo as a search.
+    Only http/https URLs are accepted.
+    Other plain text becomes a DuckDuckGo search.
     """
 
     raw = raw.strip()
@@ -183,8 +251,12 @@ def normalize_url(raw: str) -> str | None:
         r"^[a-zA-Z][a-zA-Z0-9+.-]*://",
         raw,
     ):
+
         if raw.lower().startswith(
-            ("http://", "https://")
+            (
+                "http://",
+                "https://",
+            )
         ):
             return raw
 
@@ -197,22 +269,27 @@ def normalize_url(raw: str) -> str | None:
             and "localhost" not in raw
         )
     ):
+
         return (
             "https://duckduckgo.com/?q="
             + quote_plus(raw)
         )
 
-    return "https://" + raw
+    return (
+        "https://"
+        + raw
+    )
 
 
 def clamp(
-    value: str | None,
+    value: str | int | float | None,
     lo: int,
     hi: int,
     default: int,
 ) -> int:
 
     try:
+
         return max(
             lo,
             min(
@@ -220,10 +297,12 @@ def clamp(
                 int(float(value)),
             ),
         )
+
     except (
         TypeError,
         ValueError,
     ):
+
         return default
 
 
@@ -235,7 +314,7 @@ BUTTONS = {
 
 
 # =============================================================================
-# Browser Session
+# Browser session
 # =============================================================================
 
 class Session:
@@ -265,33 +344,45 @@ class Session:
         self.closed = False
 
     # -------------------------------------------------------------------------
-    # WebSocket safe send
+    # Safe websocket JSON send
     # -------------------------------------------------------------------------
 
     async def send_json(
         self,
         obj: dict,
-    ) -> None:
+    ) -> bool:
 
         if self.closed:
-            return
+            return False
 
         async with self._lock:
 
             if self.closed:
-                return
+                return False
 
             try:
+
                 await self.ws.send_text(
-                    json.dumps(obj)
+                    json.dumps(
+                        obj,
+                        ensure_ascii=False,
+                    )
                 )
+
+                return True
 
             except (
                 WebSocketDisconnect,
                 RuntimeError,
                 Exception,
             ):
+
                 self.closed = True
+                return False
+
+    # -------------------------------------------------------------------------
+    # Safe binary send
+    # -------------------------------------------------------------------------
 
     async def send_bytes(
         self,
@@ -307,10 +398,15 @@ class Session:
                 return False
 
             try:
-                await self.ws.send_bytes(data)
+
+                await self.ws.send_bytes(
+                    data
+                )
+
                 return True
 
             except Exception:
+
                 self.closed = True
                 return False
 
@@ -328,31 +424,42 @@ class Session:
 
         try:
 
-            data = base64.b64decode(
+            raw = base64.b64decode(
                 params["data"]
             )
 
-            sent = await self.send_bytes(data)
+            sent = await self.send_bytes(
+                raw
+            )
 
             if (
                 sent
                 and self.cdp is not None
                 and not self.closed
             ):
+
                 try:
+
                     await self.cdp.send(
                         "Page.screencastFrameAck",
                         {
-                            "sessionId": params[
-                                "sessionId"
-                            ]
+                            "sessionId":
+                                params[
+                                    "sessionId"
+                                ]
                         },
                     )
+
                 except Exception:
+
                     self.closed = True
 
         except Exception:
-            self.closed = True
+
+            log.debug(
+                "Screencast frame failed",
+                exc_info=True,
+            )
 
     # -------------------------------------------------------------------------
     # Navigation update
@@ -366,23 +473,22 @@ class Session:
         if self.closed:
             return
 
+        page = self.page
+
+        if page is None:
+            return
+
         try:
 
-            if self.page is None:
-                return
-
-            title = await self.page.title()
+            title = await page.title()
 
         except Exception:
+
             title = ""
 
         try:
 
-            current_url = (
-                self.page.url
-                if self.page
-                else ""
-            )
+            current_url = page.url
 
             await self.send_json(
                 {
@@ -394,13 +500,21 @@ class Session:
             )
 
         except Exception:
+
             self.closed = True
 
     # -------------------------------------------------------------------------
-    # Start session
+    # Start
     # -------------------------------------------------------------------------
 
-    async def start(self) -> None:
+    async def start(
+        self,
+    ) -> None:
+
+        if self.browser is None:
+            raise RuntimeError(
+                "Chromium browser is not available"
+            )
 
         self.ctx = await self.browser.new_context(
             viewport={
@@ -419,26 +533,28 @@ class Session:
 
         self.page = await self.ctx.new_page()
 
-        self.page.on(
+        page = self.page
+
+        page.on(
             "framenavigated",
             lambda frame: (
                 asyncio.create_task(
                     self._nav_changed(True)
                 )
-                if self.page
+                if self.page is not None
                 and frame == self.page.main_frame
                 else None
             ),
         )
 
-        self.page.on(
+        page.on(
             "load",
             lambda _: asyncio.create_task(
                 self._nav_changed(False)
             ),
         )
 
-        self.page.on(
+        page.on(
             "dialog",
             lambda dialog: asyncio.create_task(
                 self._dismiss_dialog(dialog)
@@ -447,7 +563,9 @@ class Session:
 
         await self._start_screencast()
 
-        await self.goto(HOME_URL)
+        await self.goto(
+            HOME_URL
+        )
 
     # -------------------------------------------------------------------------
     # Dialog
@@ -464,7 +582,7 @@ class Session:
             pass
 
     # -------------------------------------------------------------------------
-    # Screencast
+    # Start screencast
     # -------------------------------------------------------------------------
 
     async def _start_screencast(
@@ -477,8 +595,12 @@ class Session:
         if self.page is None:
             return
 
-        self.cdp = await self.ctx.new_cdp_session(
-            self.page
+        await self._stop_screencast()
+
+        self.cdp = (
+            await self.ctx.new_cdp_session(
+                self.page
+            )
         )
 
         self.cdp.on(
@@ -513,19 +635,23 @@ class Session:
         self.cdp = None
 
         try:
+
             await cdp.send(
                 "Page.stopScreencast"
             )
+
         except Exception:
             pass
 
         try:
+
             await cdp.detach()
+
         except Exception:
             pass
 
     # -------------------------------------------------------------------------
-    # New popup
+    # Popup handling
     # -------------------------------------------------------------------------
 
     async def _on_new_page(
@@ -548,31 +674,34 @@ class Session:
                 timeout=10000,
             )
 
-            url = popup.url
+            popup_url = popup.url
 
             await popup.close()
 
             if (
-                url
-                and url != "about:blank"
+                popup_url
+                and popup_url != "about:blank"
                 and not self.closed
             ):
-                await self.goto(url)
+
+                await self.goto(
+                    popup_url
+                )
 
         except Exception:
-            pass
+
+            log.debug(
+                "Popup handling failed",
+                exc_info=True,
+            )
 
     # -------------------------------------------------------------------------
-    # Close session
+    # Close
     # -------------------------------------------------------------------------
 
     async def close(
         self,
     ) -> None:
-
-        if self.closed:
-            # Still make sure browser resources are closed.
-            pass
 
         self.closed = True
 
@@ -581,15 +710,21 @@ class Session:
         if self.ctx is not None:
 
             try:
+
                 await self.ctx.close()
+
             except Exception:
-                pass
+
+                log.debug(
+                    "Browser context close failed",
+                    exc_info=True,
+                )
 
         self.ctx = None
         self.page = None
 
     # -------------------------------------------------------------------------
-    # Navigation
+    # Goto
     # -------------------------------------------------------------------------
 
     async def goto(
@@ -600,27 +735,30 @@ class Session:
         if self.closed:
             return
 
-        url = normalize_url(raw)
+        page = self.page
+
+        if page is None:
+            return
+
+        url = normalize_url(
+            raw
+        )
 
         if not url:
 
             await self.send_json(
                 {
                     "type": "error",
-                    "message": (
-                        "Only http(s) URLs are allowed"
-                    ),
+                    "message":
+                        "Only http(s) URLs are allowed",
                 }
             )
 
             return
 
-        if self.page is None:
-            return
-
         try:
 
-            await self.page.goto(
+            await page.goto(
                 url,
                 wait_until="commit",
                 timeout=30000,
@@ -640,10 +778,12 @@ class Session:
                 }
             )
 
-            await self._nav_changed(False)
+            await self._nav_changed(
+                False
+            )
 
     # -------------------------------------------------------------------------
-    # Incoming event handler
+    # Incoming events
     # -------------------------------------------------------------------------
 
     async def handle(
@@ -654,17 +794,20 @@ class Session:
         if self.closed:
             return
 
-        t = m.get("type")
-        p = self.page
+        t = m.get(
+            "type"
+        )
 
-        if p is None:
+        page = self.page
+
+        if page is None:
             return
 
         try:
 
-            # ---------------------------------------------------------------
+            # -----------------------------------------------------------------
             # Navigation
-            # ---------------------------------------------------------------
+            # -----------------------------------------------------------------
 
             if t == "goto":
 
@@ -679,59 +822,81 @@ class Session:
 
             elif t == "home":
 
-                await self.goto(HOME_URL)
+                await self.goto(
+                    HOME_URL
+                )
 
             elif t == "back":
 
                 try:
-                    await p.go_back(
+
+                    await page.go_back(
                         wait_until="commit"
                     )
+
                 except Exception:
                     pass
 
             elif t == "forward":
 
                 try:
-                    await p.go_forward(
+
+                    await page.go_forward(
                         wait_until="commit"
                     )
+
                 except Exception:
                     pass
 
             elif t == "reload":
 
                 try:
-                    await p.reload(
+
+                    await page.reload(
                         wait_until="commit"
                     )
+
                 except Exception:
                     pass
 
-            # ---------------------------------------------------------------
+            # -----------------------------------------------------------------
             # Mouse
-            # ---------------------------------------------------------------
+            # -----------------------------------------------------------------
 
             elif t == "mouse":
 
-                x = float(m["x"])
-                y = float(m["y"])
+                x = float(
+                    m.get(
+                        "x",
+                        0,
+                    )
+                )
+
+                y = float(
+                    m.get(
+                        "y",
+                        0,
+                    )
+                )
 
                 action = m.get(
                     "action"
                 )
 
-                await p.mouse.move(
+                await page.mouse.move(
                     x,
                     y,
                 )
 
                 button = BUTTONS.get(
-                    m.get("button", 0),
+                    m.get(
+                        "button",
+                        0,
+                    ),
                     "left",
                 )
 
-                clicks = int(
+                click_count = int(
                     m.get(
                         "clicks",
                         1,
@@ -740,21 +905,21 @@ class Session:
 
                 if action == "down":
 
-                    await p.mouse.down(
+                    await page.mouse.down(
                         button=button,
-                        click_count=clicks,
+                        click_count=click_count,
                     )
 
                 elif action == "up":
 
-                    await p.mouse.up(
+                    await page.mouse.up(
                         button=button,
-                        click_count=clicks,
+                        click_count=click_count,
                     )
 
                 elif action == "wheel":
 
-                    await p.mouse.wheel(
+                    await page.mouse.wheel(
                         float(
                             m.get(
                                 "dx",
@@ -769,13 +934,15 @@ class Session:
                         ),
                     )
 
-            # ---------------------------------------------------------------
+            # -----------------------------------------------------------------
             # Keyboard
-            # ---------------------------------------------------------------
+            # -----------------------------------------------------------------
 
             elif t == "key":
 
-                key = m.get("key")
+                key = m.get(
+                    "key"
+                )
 
                 if (
                     isinstance(key, str)
@@ -792,19 +959,19 @@ class Session:
                         == "down"
                     ):
 
-                        await p.keyboard.down(
+                        await page.keyboard.down(
                             key
                         )
 
                     else:
 
-                        await p.keyboard.up(
+                        await page.keyboard.up(
                             key
                         )
 
-            # ---------------------------------------------------------------
+            # -----------------------------------------------------------------
             # Text / paste
-            # ---------------------------------------------------------------
+            # -----------------------------------------------------------------
 
             elif t == "text":
 
@@ -815,13 +982,15 @@ class Session:
                     )
                 )[:100_000]
 
-                await p.keyboard.insert_text(
-                    text_value
-                )
+                if text_value:
 
-            # ---------------------------------------------------------------
+                    await page.keyboard.insert_text(
+                        text_value
+                    )
+
+            # -----------------------------------------------------------------
             # Resize
-            # ---------------------------------------------------------------
+            # -----------------------------------------------------------------
 
             elif t == "resize":
 
@@ -850,19 +1019,15 @@ class Session:
 
                 await self._stop_screencast()
 
-                try:
+                await page.set_viewport_size(
+                    {
+                        "width": self.w,
+                        "height": self.h,
+                    }
+                )
 
-                    await p.set_viewport_size(
-                        {
-                            "width": self.w,
-                            "height": self.h,
-                        }
-                    )
-
-                finally:
-
-                    if not self.closed:
-                        await self._start_screencast()
+                if not self.closed:
+                    await self._start_screencast()
 
         except Exception as exc:
 
@@ -893,7 +1058,9 @@ def make_token() -> str:
         hashlib.sha256,
     ).hexdigest()
 
-    return f"{exp}.{sig}"
+    return (
+        f"{exp}.{sig}"
+    )
 
 
 def valid_token(
@@ -920,7 +1087,8 @@ def valid_token(
                 sig,
                 good,
             )
-            and int(exp) > time.time()
+            and int(exp)
+            > time.time()
         )
 
     except Exception:
@@ -968,7 +1136,7 @@ def is_locked(
 
 
 # =============================================================================
-# HTTP Authentication Middleware
+# Authentication middleware
 # =============================================================================
 
 @app.middleware("http")
@@ -986,11 +1154,15 @@ async def auth_middleware(
             "/logout",
         )
         or valid_token(
-            request.cookies.get(COOKIE)
+            request.cookies.get(
+                COOKIE
+            )
         )
     ):
 
-        return await call_next(request)
+        return await call_next(
+            request
+        )
 
     if (
         path == "/"
@@ -1000,13 +1172,15 @@ async def auth_middleware(
         return HTMLResponse(
             LOGIN_HTML,
             headers={
-                "Cache-Control": "no-store"
+                "Cache-Control":
+                    "no-store"
             },
         )
 
     return JSONResponse(
         {
-            "error": "unauthorized"
+            "error":
+                "unauthorized"
         },
         status_code=401,
     )
@@ -1021,16 +1195,17 @@ async def login(
     request: Request,
 ):
 
-    ip = client_ip(request)
+    ip = client_ip(
+        request
+    )
 
     if is_locked(ip):
 
         return JSONResponse(
             {
-                "error": (
+                "error":
                     "Too many attempts. "
                     "Try again in a few minutes."
-                )
             },
             status_code=429,
         )
@@ -1057,16 +1232,17 @@ async def login(
         )
     )
 
-    ok = (
-        hmac.compare_digest(
-            user.encode(),
-            AUTH_USER.encode(),
-        )
-        and hmac.compare_digest(
-            pw.encode(),
-            AUTH_PASSWORD.encode(),
-        )
+    user_ok = hmac.compare_digest(
+        user.encode(),
+        AUTH_USER.encode(),
     )
+
+    password_ok = hmac.compare_digest(
+        pw.encode(),
+        AUTH_PASSWORD.encode(),
+    )
+
+    ok = user_ok and password_ok
 
     if not ok:
 
@@ -1077,14 +1253,14 @@ async def login(
             time.time()
         )
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(
+            1
+        )
 
         return JSONResponse(
             {
-                "error": (
-                    "Incorrect username "
-                    "or password"
-                )
+                "error":
+                    "Incorrect username or password"
             },
             status_code=401,
         )
@@ -1101,8 +1277,7 @@ async def login(
     )
 
     secure = (
-        request.headers
-        .get(
+        request.headers.get(
             "x-forwarded-proto",
             "",
         )
@@ -1150,14 +1325,15 @@ async def logout():
 
 
 # =============================================================================
-# Current User
+# Current user
 # =============================================================================
 
 @app.get("/api/me")
 async def me():
 
     return {
-        "user": AUTH_USER
+        "user":
+            AUTH_USER
     }
 
 
@@ -1168,12 +1344,34 @@ async def me():
 @app.get("/healthz")
 async def healthz():
 
-    browser: Browser = app.state.browser
+    browser = getattr(
+        app.state,
+        "browser",
+        None,
+    )
+
+    connected = bool(
+        browser
+        and browser.is_connected()
+    )
 
     return JSONResponse(
         {
-            "ok": browser.is_connected(),
-            "sessions": app.state.active,
+            "ok": connected,
+            "browser_connected":
+                connected,
+            "sessions":
+                getattr(
+                    app.state,
+                    "active",
+                    0,
+                ),
+            "browser_error":
+                getattr(
+                    app.state,
+                    "browser_error",
+                    None,
+                ),
         }
     )
 
@@ -1188,11 +1386,18 @@ async def healthz():
 )
 async def index():
 
+    if not valid_token(
+        app.state.__dict__.get(
+            "dummy"
+        )
+    ):
+        pass
+
     return INDEX_HTML
 
 
 # =============================================================================
-# WebSocket
+# WebSocket endpoint
 # =============================================================================
 
 @app.websocket("/ws")
@@ -1205,20 +1410,63 @@ async def ws_endpoint(
     # -------------------------------------------------------------------------
 
     if not valid_token(
-        ws.cookies.get(COOKIE)
+        ws.cookies.get(
+            COOKIE
+        )
     ):
 
         try:
+
             await ws.close(
                 code=4401
             )
+
         except Exception:
             pass
 
         return
 
     # -------------------------------------------------------------------------
-    # Accept
+    # Browser availability
+    # -------------------------------------------------------------------------
+
+    browser = getattr(
+        app.state,
+        "browser",
+        None,
+    )
+
+    if browser is None:
+
+        try:
+
+            await ws.accept()
+
+            await ws.send_text(
+                json.dumps(
+                    {
+                        "type":
+                            "error",
+                        "message":
+                            (
+                                "Chromium is not available. "
+                                "Check the server logs."
+                            ),
+                    }
+                )
+            )
+
+            await ws.close(
+                code=1011
+            )
+
+        except Exception:
+            pass
+
+        return
+
+    # -------------------------------------------------------------------------
+    # Accept websocket
     # -------------------------------------------------------------------------
 
     try:
@@ -1240,11 +1488,13 @@ async def ws_endpoint(
             await ws.send_text(
                 json.dumps(
                     {
-                        "type": "error",
-                        "message": (
-                            "Server busy: "
-                            "max sessions reached"
-                        ),
+                        "type":
+                            "error",
+                        "message":
+                            (
+                                "Server busy: "
+                                "max sessions reached"
+                            ),
                     }
                 )
             )
@@ -1253,19 +1503,23 @@ async def ws_endpoint(
             pass
 
         try:
+
             await ws.close(
                 code=1013
             )
+
         except Exception:
             pass
 
         return
 
     # -------------------------------------------------------------------------
-    # Register session
+    # Create session
     # -------------------------------------------------------------------------
 
     app.state.active += 1
+
+    counted = True
 
     w = clamp(
         ws.query_params.get("w"),
@@ -1283,7 +1537,7 @@ async def ws_endpoint(
 
     sess = Session(
         ws,
-        app.state.browser,
+        browser,
         w,
         h,
     )
@@ -1291,7 +1545,7 @@ async def ws_endpoint(
     try:
 
         # ---------------------------------------------------------------------
-        # Start browser
+        # Start browser session
         # ---------------------------------------------------------------------
 
         await sess.start()
@@ -1316,10 +1570,10 @@ async def ws_endpoint(
 
                 await sess.send_json(
                     {
-                        "type": "error",
-                        "message": (
-                            "Closed after inactivity"
-                        ),
+                        "type":
+                            "error",
+                        "message":
+                            "Closed after inactivity",
                     }
                 )
 
@@ -1327,15 +1581,17 @@ async def ws_endpoint(
 
             except WebSocketDisconnect:
 
-                log.debug(
-                    "WebSocket client disconnected"
+                log.info(
+                    "Client disconnected normally"
                 )
 
                 break
 
             except RuntimeError as exc:
 
-                message = str(exc)
+                message = str(
+                    exc
+                )
 
                 if (
                     "WebSocket is not connected"
@@ -1351,20 +1607,27 @@ async def ws_endpoint(
                 raise
 
             # -----------------------------------------------------------------
-            # Parse message
+            # Parse JSON
             # -----------------------------------------------------------------
 
             try:
 
-                msg = json.loads(raw)
+                msg = json.loads(
+                    raw
+                )
 
             except json.JSONDecodeError:
 
                 continue
 
-            if isinstance(msg, dict):
+            if isinstance(
+                msg,
+                dict,
+            ):
 
-                await sess.handle(msg)
+                await sess.handle(
+                    msg
+                )
 
     except WebSocketDisconnect:
 
@@ -1398,16 +1661,18 @@ async def ws_endpoint(
     finally:
 
         # ---------------------------------------------------------------------
-        # Decrease active session count
+        # Active count
         # ---------------------------------------------------------------------
 
-        app.state.active = max(
-            0,
-            app.state.active - 1,
-        )
+        if counted:
+
+            app.state.active = max(
+                0,
+                app.state.active - 1,
+            )
 
         # ---------------------------------------------------------------------
-        # Cleanup browser session
+        # Browser cleanup
         # ---------------------------------------------------------------------
 
         try:
@@ -1422,15 +1687,15 @@ async def ws_endpoint(
             )
 
         # IMPORTANT:
-        # Do NOT call ws.close() here.
+        # Do NOT call await ws.close() here.
         #
-        # The browser/client may already have disconnected.
-        # Calling ws.close() again can cause:
+        # The client may already have disconnected. Calling close() again
+        # after the disconnect caused the earlier:
         #
         # RuntimeError:
         # WebSocket is not connected.
         #
-        # Therefore cleanup is intentionally limited to sess.close().
+        # The session is already cleaned up above.
 
 
 # =============================================================================
@@ -1453,7 +1718,7 @@ INDEX_HTML = r"""<!doctype html>
 
 <link
     rel="icon"
-    href="data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%2096%2096%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cdefs%3E%3ClinearGradient%20id%3D%22lgf%22%20x1%3D%220%22%20y1%3D%220%22%20x2%3D%221%22%20y2%3D%221%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%237c9cff%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%23b57cff%22%2F%3E%3C%2FlinearGradient%3E%3C/defs%3E%3Crect%20width%3D%2296%22%20height%3D%2296%22%20rx%3D%2226%22%20fill%3D%22url%28%23lgf%29%22%2F%3E%3Ccircle%20cx%3D%2248%22%20cy%3D%2248%22%20r%3D%2226%22%20fill%3D%22none%22%20stroke%3D%22%23fff%22%20stroke-width%3D%224%22%2F%3E%3Cellipse%20cx%3D%2248%22%20cy%3D%2248%22%20rx%3D%2211%22%20ry%3D%2226%22%20fill%3D%22none%22%20stroke%3D%22%23fff%22%20stroke-width%3D%224%22%20opacity%3D%22.9%22%2F%3E%3Cpath%20d%3D%22M22%2048h52M27%2034h42M27%2062h42%22%20stroke%3D%22%23fff%22%20stroke-width%3D%223.5%22%20stroke-linecap%3D%22round%22%20fill%3D%22none%22%20opacity%3D%22.9%22%2F%3E%3Cpath%20d%3D%22M58%2056l22%208-9%203-3%209z%22%20fill%3D%22%23fff%22%20stroke%3D%22%237c9cff%22%20stroke-width%3D%222.5%22%20stroke-linejoin%3D%22round%22%2F%3E%3C%2Fsvg%3E"
+    href="data:image/svg+xml,%3Csvg%20viewBox%3D%220%200%2096%2096%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%3E%3Cdefs%3E%3ClinearGradient%20id%3D%22lgf%22%20x1%3D%220%22%20y1%3D%220%22%20x2%3D%221%22%20y2%3D%221%22%3E%3Cstop%20offset%3D%220%22%20stop-color%3D%22%237c9cff%22%2F%3E%3Cstop%20offset%3D%221%22%20stop-color%3D%22%23b57cff%22%2F%3E%3C%2FlinearGradient%3E%3C%2Fdefs%3E%3Crect%20width%3D%2296%22%20height%3D%2296%22%20rx%3D%2226%22%20fill%3D%22url%28%23lgf%29%22%2F%3E%3Ccircle%20cx%3D%2248%22%20cy%3D%2248%22%20r%3D%2226%22%20fill%3D%22none%22%20stroke%3D%22%23fff%22%20stroke-width%3D%224%22%2F%3E%3Cellipse%20cx%3D%2248%22%20cy%3D%2248%22%20rx%3D%2211%22%20ry%3D%2226%22%20fill%3D%22none%22%20stroke%3D%22%23fff%22%20stroke-width%3D%224%22%20opacity%3D%22.9%22%2F%3E%3Cpath%20d%3D%22M22%2048h52M27%2034h42M27%2062h42%22%20stroke%3D%22%23fff%22%20stroke-width%3D%223.5%22%20stroke-linecap%3D%22round%22%20fill%3D%22none%22%20opacity%3D%22.9%22%2F%3E%3Cpath%20d%3D%22M58%2056l22%208-9%203-3%209z%22%20fill%3D%22%23fff%22%20stroke%3D%22%237c9cff%22%20stroke-width%3D%222.5%22%20stroke-linejoin%3D%22round%22%2F%3E%3C%2Fsvg%3E"
 >
 
 <style>
@@ -2231,49 +2496,52 @@ Reconnect
 
 <script>
 
-const $ = id =>
-    document.getElementById(id);
+const $ =
+    id => document.getElementById(id);
 
+const stage =
+    $('stage');
 
-const stage = $('stage');
-const cv = $('cv');
-const ctx = cv.getContext('2d');
+const cv =
+    $('cv');
 
-const url = $('url');
-const prog = $('prog');
-const dot = $('dot');
-const lock = $('lock');
-const rel = $('rel');
+const ctx =
+    cv.getContext('2d');
 
-const splash = $('splash');
-const over = $('over');
+const url =
+    $('url');
 
-const root = document.documentElement;
+const prog =
+    $('prog');
+
+const dot =
+    $('dot');
+
+const lock =
+    $('lock');
+
+const rel =
+    $('rel');
+
+const splash =
+    $('splash');
+
+const over =
+    $('over');
+
+const root =
+    document.documentElement;
 
 
 let ws = null;
-
 let last = 0;
-
 let lastErr = '';
-
 let q = Promise.resolve();
-
 let loadT = null;
-
 let opened = false;
 
-let reconnectTimer = null;
-
-let intentionalClose = false;
-
-
-/* -------------------------------------------------------------------------- */
-/* Size                                                                       */
-/* -------------------------------------------------------------------------- */
 
 const size = () => ({
-
     w: Math.max(
         320,
         Math.min(
@@ -2289,13 +2557,8 @@ const size = () => ({
             stage.clientHeight | 0
         )
     )
-
 });
 
-
-/* -------------------------------------------------------------------------- */
-/* Send                                                                       */
-/* -------------------------------------------------------------------------- */
 
 const send = obj => {
 
@@ -2322,42 +2585,38 @@ const send = obj => {
 };
 
 
-/* -------------------------------------------------------------------------- */
-/* Toast                                                                      */
-/* -------------------------------------------------------------------------- */
-
 function toast(message) {
 
     const d =
         document.createElement('div');
 
-    d.className = 'toast';
+    d.className =
+        'toast';
 
-    d.textContent = message;
+    d.textContent =
+        message;
 
     $('toasts').append(d);
 
     setTimeout(() => {
 
-        d.classList.add('out');
+        d.classList.add(
+            'out'
+        );
 
         setTimeout(() => {
-
             d.remove();
-
         }, 300);
 
     }, 4200);
 }
 
 
-/* -------------------------------------------------------------------------- */
-/* Loading                                                                    */
-/* -------------------------------------------------------------------------- */
-
 function setLoading(on) {
 
-    clearTimeout(loadT);
+    clearTimeout(
+        loadT
+    );
 
     root.classList.toggle(
         'loading',
@@ -2374,226 +2633,169 @@ function setLoading(on) {
         prog.style.transition =
             'none';
 
-        prog.style.opacity = 1;
+        prog.style.opacity =
+            1;
 
-        prog.style.width = '0%';
+        prog.style.width =
+            '0%';
 
         void prog.offsetWidth;
 
         prog.style.transition =
             'width 8s cubic-bezier(.1,.8,.2,1)';
 
-        prog.style.width = '86%';
+        prog.style.width =
+            '86%';
 
-        loadT = setTimeout(
-            () => setLoading(false),
-            30000
-        );
+        loadT =
+            setTimeout(
+                () => setLoading(false),
+                30000
+            );
 
     } else {
 
         prog.style.transition =
             'width .25s';
 
-        prog.style.width = '100%';
+        prog.style.width =
+            '100%';
 
         setTimeout(() => {
 
             prog.style.transition =
                 'opacity .35s';
 
-            prog.style.opacity = 0;
+            prog.style.opacity =
+                0;
 
         }, 260);
     }
 }
 
 
-/* -------------------------------------------------------------------------- */
-/* WebSocket URL                                                              */
-/* -------------------------------------------------------------------------- */
-
-function websocketUrl() {
-
-    const protocol =
-        location.protocol === 'https:'
-            ? 'wss'
-            : 'ws';
-
-    const { w, h } = size();
-
-    return (
-        protocol +
-        '://' +
-        location.host +
-        '/ws?w=' +
-        w +
-        '&h=' +
-        h
-    );
-}
-
-
-/* -------------------------------------------------------------------------- */
-/* Connect                                                                    */
-/* -------------------------------------------------------------------------- */
-
 function connect() {
 
-    clearTimeout(
-        reconnectTimer
+    /*
+     * Close previous socket if one still exists.
+     */
+
+    if (ws) {
+
+        try {
+
+            ws.onopen = null;
+            ws.onmessage = null;
+            ws.onerror = null;
+            ws.onclose = null;
+
+            if (
+                ws.readyState ===
+                    WebSocket.OPEN
+                ||
+                ws.readyState ===
+                    WebSocket.CONNECTING
+            ) {
+
+                ws.close();
+            }
+
+        } catch (e) {}
+
+        ws = null;
+    }
+
+
+    q =
+        Promise.resolve();
+
+    lastErr =
+        '';
+
+    opened =
+        false;
+
+    dot.className =
+        '';
+
+    over.classList.add(
+        'hide'
     );
 
-    intentionalClose = false;
-
-    lastErr = '';
-
-    opened = false;
-
-    dot.className = '';
-
-    over.classList.add('hide');
-
-    splash.classList.remove('hide');
+    splash.classList.remove(
+        'hide'
+    );
 
     $('splashTxt').textContent =
         'Starting your private browser…';
 
+
+    const {
+        w,
+        h
+    } = size();
+
+
+    const scheme =
+        location.protocol ===
+            'https:'
+            ? 'wss'
+            : 'ws';
+
+
     const socket =
         new WebSocket(
-            websocketUrl()
+            scheme
+            + '://'
+            + location.host
+            + '/ws?w='
+            + w
+            + '&h='
+            + h
         );
 
-    ws = socket;
 
+    ws =
+        socket;
 
-    /* ---------------------------------------------------------------------- */
-    /* Open                                                                   */
-    /* ---------------------------------------------------------------------- */
 
     socket.onopen = () => {
 
-        if (socket !== ws)
+        if (
+            socket !== ws
+        )
             return;
 
-        opened = true;
+        opened =
+            true;
 
-        dot.className = 'on';
+        dot.className =
+            'on';
 
-        try {
-            cv.focus();
-        } catch (e) {}
-
+        cv.focus();
     };
 
 
-    /* ---------------------------------------------------------------------- */
-    /* Message                                                                */
-    /* ---------------------------------------------------------------------- */
+    socket.onmessage =
+        event => {
 
-    socket.onmessage = event => {
-
-        if (socket !== ws)
-            return;
-
-
-        /* JSON */
-
-        if (
-            typeof event.data ===
-            'string'
-        ) {
-
-            let m;
-
-            try {
-
-                m = JSON.parse(
-                    event.data
-                );
-
-            } catch (e) {
-
+            if (
+                socket !== ws
+            )
                 return;
-            }
 
 
             if (
-                m.type === 'nav'
+                typeof event.data ===
+                'string'
             ) {
 
-                if (
-                    document.activeElement
-                    !== url
-                ) {
-
-                    url.value =
-                        m.url === 'about:blank'
-                            ? ''
-                            : m.url || '';
-                }
-
-
-                lock.dataset.s =
-                    typeof m.url === 'string'
-                    &&
-                    m.url.startsWith(
-                        'https:'
-                    )
-                        ? '1'
-                        : '0';
-
-
-                document.title =
-                    m.title
-                        ? m.title +
-                          ' – PyBrowser'
-                        : 'PyBrowser';
-
-
-                setLoading(
-                    !!m.loading
-                );
-
-                return;
-            }
-
-
-            if (
-                m.type === 'error'
-            ) {
-
-                lastErr =
-                    m.message ||
-                    'Unknown error';
-
-                toast(
-                    lastErr
-                );
-
-                return;
-            }
-
-            return;
-        }
-
-
-        /* JPEG */
-
-        q = q.then(
-            async () => {
-
-                if (
-                    socket !== ws
-                )
-                    return;
-
-                let bmp;
+                let m;
 
                 try {
 
-                    bmp =
-                        await createImageBitmap(
+                    m =
+                        JSON.parse(
                             event.data
                         );
 
@@ -2604,97 +2806,189 @@ function connect() {
 
 
                 if (
-                    socket !== ws
+                    m.type ===
+                    'nav'
                 ) {
 
-                    bmp.close();
+                    const currentUrl =
+                        m.url || '';
+
+
+                    if (
+                        document.activeElement
+                        !== url
+                    ) {
+
+                        url.value =
+                            currentUrl ===
+                            'about:blank'
+                                ? ''
+                                : currentUrl;
+                    }
+
+
+                    lock.dataset.s =
+                        currentUrl.startsWith(
+                            'https:'
+                        )
+                            ? '1'
+                            : '0';
+
+
+                    document.title =
+                        m.title
+                            ? (
+                                m.title
+                                + ' – PyBrowser'
+                            )
+                            : 'PyBrowser';
+
+
+                    setLoading(
+                        !!m.loading
+                    );
 
                     return;
                 }
 
 
                 if (
-                    cv.width !==
-                        bmp.width
-                    ||
-                    cv.height !==
-                        bmp.height
+                    m.type ===
+                    'error'
                 ) {
 
-                    cv.width =
-                        bmp.width;
+                    lastErr =
+                        m.message ||
+                        'Unknown error';
 
-                    cv.height =
-                        bmp.height;
-                }
-
-
-                ctx.drawImage(
-                    bmp,
-                    0,
-                    0
-                );
-
-
-                bmp.close();
-
-
-                if (
-                    !cv.classList.contains(
-                        'show'
-                    )
-                ) {
-
-                    cv.classList.add(
-                        'show'
+                    toast(
+                        lastErr
                     );
 
-                    splash.classList.add(
-                        'hide'
-                    );
+                    return;
                 }
 
+                return;
             }
-        ).catch(
-            () => {}
-        );
-    };
 
 
-    /* ---------------------------------------------------------------------- */
-    /* Error                                                                  */
-    /* ---------------------------------------------------------------------- */
+            q =
+                q.then(
+                    async () => {
+
+                        if (
+                            socket !== ws
+                        )
+                            return;
+
+                        let bmp = null;
+
+                        try {
+
+                            bmp =
+                                await createImageBitmap(
+                                    event.data
+                                );
+
+                        } catch (e) {
+
+                            return;
+                        }
+
+
+                        if (
+                            socket !== ws
+                        ) {
+
+                            bmp.close();
+
+                            return;
+                        }
+
+
+                        if (
+                            cv.width !==
+                                bmp.width
+                            ||
+                            cv.height !==
+                                bmp.height
+                        ) {
+
+                            cv.width =
+                                bmp.width;
+
+                            cv.height =
+                                bmp.height;
+                        }
+
+
+                        ctx.drawImage(
+                            bmp,
+                            0,
+                            0
+                        );
+
+                        bmp.close();
+
+
+                        if (
+                            !cv.classList.contains(
+                                'show'
+                            )
+                        ) {
+
+                            cv.classList.add(
+                                'show'
+                            );
+
+                            splash.classList.add(
+                                'hide'
+                            );
+                        }
+
+                    }
+                )
+                .catch(
+                    () => {}
+                );
+        };
+
 
     socket.onerror = () => {
 
-        if (socket !== ws)
+        if (
+            socket !== ws
+        )
             return;
 
         lastErr =
             'WebSocket connection error';
 
-        dot.className = 'off';
+        dot.className =
+            'off';
     };
 
 
-    /* ---------------------------------------------------------------------- */
-    /* Close                                                                  */
-    /* ---------------------------------------------------------------------- */
-
     socket.onclose = event => {
 
-        if (socket !== ws)
+        if (
+            socket !== ws
+        )
             return;
 
-        opened = false;
+        opened =
+            false;
 
-        dot.className = 'off';
+        dot.className =
+            'off';
 
         cv.classList.remove(
             'show'
         );
 
-        setLoading(false);
+        setLoading(
+            false
+        );
 
 
         const busy =
@@ -2705,6 +2999,35 @@ function connect() {
             );
 
 
+        /*
+         * 4401 = authentication failure.
+         */
+
+        if (
+            event.code === 4401
+        ) {
+
+            fetch(
+                '/api/me',
+                {
+                    cache: 'no-store'
+                }
+            )
+                .then(
+                    r => {
+                        if (
+                            r.status === 401
+                        ) {
+                            location.reload();
+                        }
+                    }
+                )
+                .catch(
+                    () => {}
+                );
+        }
+
+
         $('overH').textContent =
             busy
                 ? 'Server is busy'
@@ -2712,7 +3035,8 @@ function connect() {
 
 
         $('overP').textContent =
-            lastErr ||
+            lastErr
+            ||
             'The session ended.';
 
 
@@ -2723,30 +3047,6 @@ function connect() {
         over.classList.remove(
             'hide'
         );
-
-
-        /*
-         * Check whether authentication
-         * is still valid.
-         */
-
-        if (!opened) {
-
-            fetch('/api/me')
-                .then(r => {
-
-                    if (
-                        r.status === 401
-                    ) {
-
-                        location.reload();
-                    }
-
-                })
-                .catch(
-                    () => {}
-                );
-        }
     };
 }
 
@@ -2755,51 +3055,40 @@ function connect() {
 /* Reconnect                                                                  */
 /* -------------------------------------------------------------------------- */
 
-$('reco').onclick = () => {
+$('reco').onclick =
+    () => {
 
-    connect();
+        connect();
 
-};
+    };
 
 
 /* -------------------------------------------------------------------------- */
-/* Navigation buttons                                                         */
+/* Navigation                                                                 */
 /* -------------------------------------------------------------------------- */
 
-$('back').onclick = () => {
-
-    send({
+$('back').onclick =
+    () => send({
         type: 'back'
     });
 
-};
 
-
-$('fwd').onclick = () => {
-
-    send({
+$('fwd').onclick =
+    () => send({
         type: 'forward'
     });
 
-};
 
-
-rel.onclick = () => {
-
-    send({
+rel.onclick =
+    () => send({
         type: 'reload'
     });
 
-};
 
-
-$('home').onclick = () => {
-
-    send({
+$('home').onclick =
+    () => send({
         type: 'home'
     });
-
-};
 
 
 /* -------------------------------------------------------------------------- */
@@ -2809,7 +3098,19 @@ $('home').onclick = () => {
 $('logout').onclick =
     async () => {
 
-        intentionalClose = true;
+        try {
+
+            if (
+                ws &&
+                ws.readyState ===
+                    WebSocket.OPEN
+            ) {
+
+                ws.close();
+            }
+
+        } catch (e) {}
+
 
         try {
 
@@ -2830,60 +3131,65 @@ $('logout').onclick =
 /* Fullscreen                                                                 */
 /* -------------------------------------------------------------------------- */
 
-$('full').onclick = () => {
+$('full').onclick =
+    () => {
 
-    if (
-        document.fullscreenElement
-    ) {
+        if (
+            document.fullscreenElement
+        ) {
 
-        document.exitFullscreen();
+            document.exitFullscreen();
 
-    } else {
+        } else {
 
-        root.requestFullscreen()
-            .catch(
-                () => {}
-            );
-    }
-};
+            root.requestFullscreen()
+                .catch(
+                    () => {}
+                );
+        }
+    };
 
 
 /* -------------------------------------------------------------------------- */
 /* Theme                                                                      */
 /* -------------------------------------------------------------------------- */
 
-$('theme').onclick = () => {
+$('theme').onclick =
+    () => {
 
-    const theme =
-        root.dataset.theme === 'dark'
-            ? 'light'
-            : 'dark';
+        const theme =
+            root.dataset.theme ===
+            'dark'
+                ? 'light'
+                : 'dark';
 
-    root.dataset.theme =
-        theme;
+        root.dataset.theme =
+            theme;
 
-    try {
+        try {
 
-        localStorage.setItem(
-            'pb-theme',
-            theme
-        );
+            localStorage.setItem(
+                'pb-theme',
+                theme
+            );
 
-    } catch (e) {}
-};
+        } catch (e) {}
+    };
 
 
 try {
 
-    const theme =
+    const savedTheme =
         localStorage.getItem(
             'pb-theme'
         );
 
-    if (theme) {
+    if (
+        savedTheme
+    ) {
 
         root.dataset.theme =
-            theme;
+            savedTheme;
     }
 
 } catch (e) {}
@@ -2898,12 +3204,15 @@ url.addEventListener(
     e => {
 
         if (
-            e.key === 'Enter'
+            e.key ===
+            'Enter'
         ) {
 
             send({
-                type: 'goto',
-                url: url.value
+                type:
+                    'goto',
+                url:
+                    url.value
             });
 
             url.blur();
@@ -2911,13 +3220,15 @@ url.addEventListener(
             cv.focus();
 
         } else if (
-            e.key === 'Escape'
+            e.key ===
+            'Escape'
         ) {
 
             url.blur();
 
             cv.focus();
         }
+
     }
 );
 
@@ -2936,7 +3247,7 @@ url.addEventListener(
 
 
 /* -------------------------------------------------------------------------- */
-/* Coordinate conversion                                                      */
+/* Mouse coordinates                                                          */
 /* -------------------------------------------------------------------------- */
 
 const pt = e => {
@@ -2980,13 +3291,17 @@ cv.addEventListener(
         )
             return;
 
-        last = now;
+        last =
+            now;
 
         send({
-            type: 'mouse',
-            action: 'move',
+            type:
+                'mouse',
+            action:
+                'move',
             ...pt(e)
         });
+
     }
 );
 
@@ -3002,10 +3317,14 @@ cv.addEventListener(
         cv.focus();
 
         send({
-            type: 'mouse',
-            action: 'down',
-            button: e.button,
-            clicks: e.detail || 1,
+            type:
+                'mouse',
+            action:
+                'down',
+            button:
+                e.button,
+            clicks:
+                e.detail || 1,
             ...pt(e)
         });
 
@@ -3018,7 +3337,8 @@ cv.addEventListener(
                 'div'
             );
 
-        d.className = 'rip';
+        d.className =
+            'rip';
 
         d.style.left =
             (
@@ -3032,7 +3352,9 @@ cv.addEventListener(
                 r.top
             ) + 'px';
 
-        stage.append(d);
+        stage.append(
+            d
+        );
 
         d.onanimationend =
             () => d.remove();
@@ -3049,10 +3371,14 @@ cv.addEventListener(
     e => {
 
         send({
-            type: 'mouse',
-            action: 'up',
-            button: e.button,
-            clicks: e.detail || 1,
+            type:
+                'mouse',
+            action:
+                'up',
+            button:
+                e.button,
+            clicks:
+                e.detail || 1,
             ...pt(e)
         });
 
@@ -3071,16 +3397,21 @@ cv.addEventListener(
         e.preventDefault();
 
         send({
-            type: 'mouse',
-            action: 'wheel',
-            dx: e.deltaX,
-            dy: e.deltaY,
+            type:
+                'mouse',
+            action:
+                'wheel',
+            dx:
+                e.deltaX,
+            dy:
+                e.deltaY,
             ...pt(e)
         });
 
     },
     {
-        passive: false
+        passive:
+            false
     }
 );
 
@@ -3103,8 +3434,10 @@ cv.addEventListener(
 /* Keyboard                                                                   */
 /* -------------------------------------------------------------------------- */
 
-const mod = e =>
-    e.ctrlKey || e.metaKey;
+const mod =
+    e =>
+        e.ctrlKey ||
+        e.metaKey;
 
 
 cv.addEventListener(
@@ -3116,11 +3449,12 @@ cv.addEventListener(
 
 
         /*
-         * Let paste event handle Ctrl+V.
+         * Ctrl/Cmd + V is handled by the paste event.
          */
 
         if (
-            mod(e) &&
+            mod(e)
+            &&
             k === 'v'
         ) {
 
@@ -3129,12 +3463,14 @@ cv.addEventListener(
 
 
         /*
-         * Ctrl+L / F6
+         * Ctrl/Cmd + L
+         * F6
          */
 
         if (
             (
-                mod(e) &&
+                mod(e)
+                &&
                 k === 'l'
             )
             ||
@@ -3150,12 +3486,14 @@ cv.addEventListener(
 
 
         /*
-         * Ctrl+R / F5
+         * Ctrl/Cmd + R
+         * F5
          */
 
         if (
             (
-                mod(e) &&
+                mod(e)
+                &&
                 k === 'r'
             )
             ||
@@ -3165,7 +3503,8 @@ cv.addEventListener(
             e.preventDefault();
 
             send({
-                type: 'reload'
+                type:
+                    'reload'
             });
 
             return;
@@ -3177,14 +3516,17 @@ cv.addEventListener(
          */
 
         if (
-            e.altKey &&
-            e.key === 'ArrowLeft'
+            e.altKey
+            &&
+            e.key ===
+                'ArrowLeft'
         ) {
 
             e.preventDefault();
 
             send({
-                type: 'back'
+                type:
+                    'back'
             });
 
             return;
@@ -3196,14 +3538,17 @@ cv.addEventListener(
          */
 
         if (
-            e.altKey &&
-            e.key === 'ArrowRight'
+            e.altKey
+            &&
+            e.key ===
+                'ArrowRight'
         ) {
 
             e.preventDefault();
 
             send({
-                type: 'forward'
+                type:
+                    'forward'
             });
 
             return;
@@ -3213,9 +3558,12 @@ cv.addEventListener(
         e.preventDefault();
 
         send({
-            type: 'key',
-            action: 'down',
-            key: e.key
+            type:
+                'key',
+            action:
+                'down',
+            key:
+                e.key
         });
 
     }
@@ -3231,8 +3579,10 @@ cv.addEventListener(
     e => {
 
         if (
-            mod(e) &&
-            e.key.toLowerCase() === 'v'
+            mod(e)
+            &&
+            e.key.toLowerCase()
+                === 'v'
         ) {
 
             return;
@@ -3241,9 +3591,12 @@ cv.addEventListener(
         e.preventDefault();
 
         send({
-            type: 'key',
-            action: 'up',
-            key: e.key
+            type:
+                'key',
+            action:
+                'up',
+            key:
+                e.key
         });
 
     }
@@ -3261,14 +3614,17 @@ cv.addEventListener(
         e.preventDefault();
 
         const text =
-            e.clipboardData
-                .getData('text');
+            e.clipboardData.getData(
+                'text'
+            );
 
         if (text) {
 
             send({
-                type: 'text',
-                text
+                type:
+                    'text',
+                text:
+                    text
             });
         }
 
@@ -3280,31 +3636,35 @@ cv.addEventListener(
 /* Resize                                                                     */
 /* -------------------------------------------------------------------------- */
 
-let rt;
+let rt = null;
 
 addEventListener(
     'resize',
     () => {
 
-        clearTimeout(rt);
-
-        rt = setTimeout(
-            () => {
-
-                const {
-                    w,
-                    h
-                } = size();
-
-                send({
-                    type: 'resize',
-                    w,
-                    h
-                });
-
-            },
-            250
+        clearTimeout(
+            rt
         );
+
+        rt =
+            setTimeout(
+                () => {
+
+                    const {
+                        w,
+                        h
+                    } = size();
+
+                    send({
+                        type:
+                            'resize',
+                        w,
+                        h
+                    });
+
+                },
+                250
+            );
 
     }
 );
@@ -3365,7 +3725,6 @@ Sign in – PyBrowser
     --acc2:#b57cff;
     --ok:#4ade80;
     --bad:#f87171;
-    --warn:#fbbf24;
     --sh:0 10px 34px #0007
 }
 
@@ -3423,7 +3782,9 @@ body{
 
 @keyframes float{
     to{
-        transform:translate(60px,-40px) scale(1.2)
+        transform:
+            translate(60px,-40px)
+            scale(1.2)
     }
 }
 
@@ -3482,11 +3843,6 @@ body{
     }
 }
 
-h1{
-    margin:0 0 4px;
-    font-size:22px
-}
-
 p.s{
     margin:0 0 22px;
     color:var(--mut)
@@ -3501,19 +3857,24 @@ p.s{
 .f input{
     width:100%;
     height:46px;
-    padding:0 44px 0 14px;
+    padding:
+        0 44px 0 14px;
     border-radius:12px;
     border:1.5px solid transparent;
     background:var(--chip);
     color:var(--fg);
     font:inherit;
     outline:0;
-    transition:border-color .25s,box-shadow .25s,background .25s
+    transition:
+        border-color .25s,
+        box-shadow .25s,
+        background .25s
 }
 
 .f input:focus{
     border-color:var(--acc);
-    box-shadow:0 0 0 4px #7c9cff29;
+    box-shadow:
+        0 0 0 4px #7c9cff29;
     background:var(--bg)
 }
 
@@ -3532,7 +3893,9 @@ p.s{
     background:transparent;
     color:var(--mut);
     cursor:pointer;
-    transition:color .2s,background .2s
+    transition:
+        color .2s,
+        background .2s
 }
 
 #eye:hover{
@@ -3561,17 +3924,22 @@ p.s{
     color:#fff;
     cursor:pointer;
     position:relative;
-    background:linear-gradient(
-        135deg,
-        var(--acc),
-        var(--acc2)
-    );
-    transition:transform .15s,box-shadow .25s,filter .2s
+    background:
+        linear-gradient(
+            135deg,
+            var(--acc),
+            var(--acc2)
+        );
+    transition:
+        transform .15s,
+        box-shadow .25s,
+        filter .2s
 }
 
 #go:hover{
     transform:translateY(-2px);
-    box-shadow:0 10px 24px #7c9cff55
+    box-shadow:
+        0 10px 24px #7c9cff55
 }
 
 #go:active{
@@ -3598,7 +3966,8 @@ p.s{
     border-radius:50%;
     border:3px solid #fff5;
     border-top-color:#fff;
-    animation:rot .7s linear infinite
+    animation:
+        rot .7s linear infinite
 }
 
 #go.ok{
@@ -3616,15 +3985,6 @@ p.s{
     margin-top:12px;
     color:var(--bad);
     font-size:13px
-}
-
-@media (prefers-reduced-motion:reduce){
-
-    *{
-        animation-duration:.01s!important;
-        transition-duration:.01s!important
-    }
-
 }
 
 </style>
@@ -3803,48 +4163,53 @@ const $ =
     id =>
         document.getElementById(id);
 
+const card =
+    $('card');
 
-const card = $('card');
-const u = $('u');
-const p = $('p');
-const go = $('go');
-const err = $('err');
+const u =
+    $('u');
 
+const p =
+    $('p');
 
-/* Theme */
+const go =
+    $('go');
+
+const err =
+    $('err');
+
 
 try {
 
-    const theme =
+    const t =
         localStorage.getItem(
             'pb-theme'
         );
 
-    if (theme) {
+    if (t) {
 
-        document.documentElement.dataset.theme =
-            theme;
+        document.documentElement
+            .dataset.theme = t;
     }
 
 } catch (e) {}
 
 
-/* Show password */
+$('eye').onclick =
+    () => {
 
-$('eye').onclick = () => {
+        p.type =
+            p.type === 'password'
+                ? 'text'
+                : 'password';
 
-    p.type =
-        p.type === 'password'
-            ? 'text'
-            : 'password';
-
-    p.focus();
-};
+        p.focus();
+    };
 
 
-/* Login failure */
-
-function fail(message) {
+function fail(
+    message
+) {
 
     err.textContent =
         message;
@@ -3863,26 +4228,27 @@ function fail(message) {
         'busy'
     );
 
-    go.disabled = false;
+    go.disabled =
+        false;
 
     p.select();
 }
 
-
-/* Submit */
 
 card.onsubmit =
     async e => {
 
         e.preventDefault();
 
-        err.textContent = '';
+        err.textContent =
+            '';
 
         go.classList.add(
             'busy'
         );
 
-        go.disabled = true;
+        go.disabled =
+            true;
 
 
         try {
@@ -3891,7 +4257,8 @@ card.onsubmit =
                 await fetch(
                     '/login',
                     {
-                        method: 'POST',
+                        method:
+                            'POST',
 
                         headers: {
                             'Content-Type':
@@ -3927,9 +4294,9 @@ card.onsubmit =
                 go.firstChild.textContent =
                     'Welcome ✓';
 
-
                 setTimeout(
-                    () => location.reload(),
+                    () =>
+                        location.reload(),
                     400
                 );
 
@@ -3950,7 +4317,7 @@ card.onsubmit =
                 'Sign-in failed'
             );
 
-        } catch (x) {
+        } catch (e) {
 
             fail(
                 'Network error. Please try again.'
@@ -3963,3 +4330,26 @@ card.onsubmit =
 </body>
 </html>
 """
+
+
+# =============================================================================
+# Local run
+# =============================================================================
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    log.info(
+        "Starting Uvicorn on %s:%s",
+        HOST,
+        PORT,
+    )
+
+    uvicorn.run(
+        "app:app",
+        host=HOST,
+        port=PORT,
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+    )
